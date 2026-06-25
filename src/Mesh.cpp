@@ -1,14 +1,56 @@
 #include "Mesh.h"
 //#include <Arduino.h>
+#if defined(ENABLE_OTA)
+#include "helpers/ota/OtaContext.h"   // OTA mesh-integration is centralized here so every role gets it
+#endif
 
 namespace mesh {
 
+#if defined(ENABLE_OTA)
+// Adapter so the portable OtaManager can emit packets through the mesh (lowest priority, hop-capped).
+void Mesh::otaSendAdapter(void* ctx, const uint8_t* msg, uint16_t len, bool /*flood*/) {
+  Mesh* m = (Mesh*)ctx;
+  Packet* p = m->createOtaPacket(msg, len);
+  if (p) m->sendOtaFlood(p);
+}
+#endif
+
 void Mesh::begin() {
   Dispatcher::begin();
+#if defined(ENABLE_OTA)
+  uint32_t my_tid = 0;
+  #ifdef MOTA_TARGET_ID
+    my_tid = (uint32_t)(MOTA_TARGET_ID);   // sha2-256:4(env name), injected by build.sh
+  #endif
+  ota::ota_ctx().begin(my_tid, Mesh::otaSendAdapter, this);   // also sets the platform apply codec
+#endif
 }
 
 void Mesh::loop() {
   Dispatcher::loop();
+#if defined(ENABLE_OTA)
+  // Deferred apply-reboot: a verified `ota applydelta` approves the update but does NOT reboot inline,
+  // so its "verified; applying" reply can be delivered first (over LoRa that reply is the operator's
+  // only confirmation the apply started). Reboot once that reply has actually been transmitted (the
+  // outbound queue drains) after a short grace to let it be queued, with a hard cap for a busy node
+  // whose queue never idles.
+  {
+    ota::OtaContext& oc = ota::ota_ctx();
+    if (oc.apply_pending) {
+      if (oc.apply_at == 0) {
+        oc.apply_at = futureMillis(1500);
+        oc.apply_hard = futureMillis(15000);
+      } else if (millisHasNowPassed(oc.apply_at) &&
+                 (_mgr->getOutboundTotal() == 0 || millisHasNowPassed(oc.apply_hard))) {
+        ota::ota_reboot_to_apply();          // does not return
+      }
+    }
+  }
+  if (millisHasNowPassed(_next_ota_tick)) {
+    ota::ota_ctx().manager.loop();         // re-request still-missing OTA blocks (rate-limited)
+    _next_ota_tick = futureMillis(3000);
+  }
+#endif
 }
 
 bool Mesh::allowPacketForward(const mesh::Packet* packet) { 
@@ -309,6 +351,28 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       }
       break;
 
+#if defined(ENABLE_OTA)
+    case PAYLOAD_TYPE_OTA: {
+      // ALWAYS process every received copy: OTA handlers are idempotent, and "eventually reliable"
+      // retries deliberately re-send IDENTICAL requests — if we gated processing on hasSeen(), the
+      // dedup would suppress those retries and the transfer could never recover from a lost reply.
+      // hasSeen() is used ONLY to avoid re-flooding the same packet more than once.
+      bool seen = _tables->hasSeen(pkt);
+      ota::ota_ctx().manager.on_message(pkt->payload, pkt->payload_len);  // central OTA receive (all roles)
+      onOtaRecv(pkt);                                                     // optional per-example hook
+      // Re-flood with a hop cap and the LOWEST priority, so OTA never competes with mesh traffic.
+      uint8_t n = pkt->getPathHashCount();
+      if (!seen && pkt->isRouteFlood() && !pkt->isMarkedDoNotRetransmit()
+          && n < getOtaHopLimit()
+          && (n + 1) * pkt->getPathHashSize() <= MAX_PATH_SIZE
+          && allowPacketForward(pkt)) {
+        self_id.copyHashTo(&pkt->path[n * pkt->getPathHashSize()], pkt->getPathHashSize());
+        pkt->setPathHashCount(n + 1);
+        action = ACTION_RETRANSMIT_DELAYED(OTA_TX_PRIORITY, getRetransmitDelay(pkt));
+      }
+      break;
+    }
+#endif
     default:
       MESH_DEBUG_PRINTLN("%s Mesh::onRecvPacket(): unknown payload type, header: %d", getLogDateTime(), (int) pkt->header);
       // Don't flood route unknown packet types!   action = routeRecvPacket(pkt);
@@ -618,6 +682,29 @@ Packet* Mesh::createControlData(const uint8_t* data, size_t len) {
 
   return packet;
 }
+
+#if defined(ENABLE_OTA)
+Packet* Mesh::createOtaPacket(const uint8_t* data, size_t len) {
+  if (len > sizeof(Packet::payload)) return NULL;
+  Packet* packet = obtainNewPacket();
+  if (packet == NULL) {
+    MESH_DEBUG_PRINTLN("%s Mesh::createOtaPacket(): error, packet pool empty", getLogDateTime());
+    return NULL;
+  }
+  packet->header = (PAYLOAD_TYPE_OTA << PH_TYPE_SHIFT);  // ROUTE_TYPE_* set by sendOtaFlood
+  memcpy(packet->payload, data, len);
+  packet->payload_len = len;
+  return packet;
+}
+
+void Mesh::sendOtaFlood(Packet* packet, uint32_t delay_millis) {
+  packet->header &= ~PH_ROUTE_MASK;
+  packet->header |= ROUTE_TYPE_FLOOD;
+  packet->setPathHashSizeAndCount(1, 0);
+  _tables->hasSeen(packet);   // mark as sent, in case it floods back to us
+  sendPacket(packet, OTA_TX_PRIORITY, delay_millis);
+}
+#endif
 
 void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_size) {
   if (packet->getPayloadType() == PAYLOAD_TYPE_TRACE) {

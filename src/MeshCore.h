@@ -64,6 +64,17 @@ public:
   virtual uint8_t getStartupReason() const = 0;
   virtual bool getBootloaderVersion(char* version, size_t max_len) { return false; }
   virtual bool startOTAUpdate(const char* id, char reply[]) { return false; }   // not supported
+#if defined(ENABLE_OTA)
+  // 4-byte build-target discriminator for OTA-over-LoRa (docs/ota_protocol.md §9). Default is the
+  // MOTA_TARGET_ID build flag injected by build.sh; 0 when unset (e.g. a bare IDE build).
+  virtual uint32_t getOtaTargetId() const {
+  #ifdef MOTA_TARGET_ID
+    return (uint32_t)(MOTA_TARGET_ID);
+  #else
+    return 0;
+  #endif
+  }
+#endif
 
   // Power management interface (boards with power management override these)
   virtual bool isExternalPowered() { return false; }

@@ -4,6 +4,9 @@
 #include "AdvertDataHelpers.h"
 #include "TxtDataHelpers.h"
 #include <RTClib.h>
+#if defined(ENABLE_OTA)
+  #include "ota/OtaCli.h"
+#endif
 
 #ifndef BRIDGE_MAX_BAUD
 #define BRIDGE_MAX_BAUD 115200
@@ -306,6 +309,10 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       sprintf(reply, "%s (Build: %s)", _callbacks->getFirmwareVer(), _callbacks->getBuildDate());
     } else if (memcmp(command, "board", 5) == 0) {
       sprintf(reply, "%s", _board->getManufacturerName());
+#if defined(ENABLE_OTA)
+    } else if (memcmp(command, "ota", 3) == 0 && (command[3] == 0 || command[3] == ' ')) {
+      mesh::ota::handle_ota_command(command, reply, *_board);
+#endif
     } else if (memcmp(command, "sensor get ", 11) == 0) {
       const char* key = command + 11;
       const char* val = _sensors->getSettingByKey(key);
