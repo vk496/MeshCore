@@ -2,6 +2,20 @@
 //#include <Arduino.h>
 #if defined(ENABLE_OTA)
 #include "helpers/ota/OtaContext.h"   // OTA mesh-integration is centralized here so every role gets it
+#include "helpers/ota/OtaProtocol.h"  // decode_adv -> the `ota neighbors` discovery table
+#include "helpers/ota/OtaSelf.h"      // ota_self_firmware -> auto-advertise our own image
+#ifndef OTA_ANNOUNCE_BOOT_MS
+#define OTA_ANNOUNCE_BOOT_MS      30000UL     // first self-advert ~30 s after boot (let the node settle)
+#endif
+#ifndef OTA_ANNOUNCE_BURST
+#define OTA_ANNOUNCE_BURST        4           // a few closely-spaced boot adverts so co-booting peers catch one
+#endif
+#ifndef OTA_ANNOUNCE_BURST_MS
+#define OTA_ANNOUNCE_BURST_MS     45000UL     // spacing during the boot burst (~3 min total), then ...
+#endif
+#ifndef OTA_ANNOUNCE_INTERVAL_MS
+#define OTA_ANNOUNCE_INTERVAL_MS  86400000UL  // ... every 24 h — all lowest priority, duty-gated
+#endif
 #endif
 
 namespace mesh {
@@ -22,7 +36,13 @@ void Mesh::begin() {
   #ifdef MOTA_TARGET_ID
     my_tid = (uint32_t)(MOTA_TARGET_ID);   // sha2-256:4(env name), injected by build.sh
   #endif
-  ota::ota_ctx().begin(my_tid, Mesh::otaSendAdapter, this);   // also sets the platform apply codec
+  const char* my_hw = "";
+  #ifdef MOTA_HW_ID
+    my_hw = MOTA_HW_ID;                     // human-readable hardware tag (per-variant), for the apply hw gate
+  #endif
+  ota::ota_ctx().begin(my_tid, Mesh::otaSendAdapter, this, my_hw);   // also sets the platform apply codec
+  ota::ota_ctx().manager.set_seeder_id(self_id.pub_key);      // node id (pubkey[0:4]) for advert seeder count
+  _next_ota_announce = futureMillis(OTA_ANNOUNCE_BOOT_MS);    // advertise our own fw shortly after boot
 #endif
 }
 
@@ -47,8 +67,43 @@ void Mesh::loop() {
     }
   }
   if (millisHasNowPassed(_next_ota_tick)) {
-    ota::ota_ctx().manager.loop();         // re-request still-missing OTA blocks (rate-limited)
+    // one-shot on first tick: resume an interrupted fetch left staged in flash before a reboot. Only adopt
+    // a PARTIAL container (continue fetching the holes); a COMPLETE one is left for manual/auto-install,
+    // not re-adopted at boot. requestMissing() (inside resumeStaged) drives the rest via REQ/DATA.
+    if (!_ota_resumed) {
+      _ota_resumed = true;
+      ota::OtaContext& oc = ota::ota_ctx();
+      if (oc.manager.fetchState() == ota::OtaManager::IDLE && oc.manager.resumeStaged(nullptr)
+          && oc.manager.fetchState() == ota::OtaManager::COMPLETE) {
+        oc.manager.reset_session();        // don't auto-adopt a complete staged container on boot
+      }
+    }
+    ota::ota_ctx().manager.set_clock(_ms->getMillis());   // for discovery jitter/ages + the pending-query timer
+    ota::ota_ctx().manager.loop();         // re-request still-missing OTA blocks + fire scheduled queries
     _next_ota_tick = futureMillis(3000);
+  }
+  if (millisHasNowPassed(_next_ota_announce)) {   // auto-advertise so peers discover us (tiny beacon)
+    ota::OtaContext& oc = ota::ota_ctx();
+    // To be discoverable as a source of our OWN firmware, set up flash-backed self-serve once; then the
+    // beacon (announce) advertises our served set and peers can QUERY + fetch it.
+    if (!oc.serving) oc.serving = ota::ota_serve_self(oc, 0);
+    oc.manager.announce();
+    // boot burst (a few closely-spaced adverts so a co-booting peer catches one), then settle to daily
+    _next_ota_announce = futureMillis(_ota_announce_count < OTA_ANNOUNCE_BURST
+                                      ? OTA_ANNOUNCE_BURST_MS : OTA_ANNOUNCE_INTERVAL_MS);
+    if (_ota_announce_count < 250) _ota_announce_count++;
+  }
+  {   // auto-install (once per COMPLETE fetch): only signed images, and apply_fetched enforces trust
+    ota::OtaContext& oc = ota::ota_ctx();
+    if (oc.manager.fetchState() != ota::OtaManager::COMPLETE) {
+      _ota_autoinstall_tried = false;
+    } else if (!_ota_autoinstall_tried && !oc.apply_pending
+               && oc.autoinstall == ota::OtaContext::AUTOINSTALL_TRUSTED
+               && oc.manager.fetched_is_signed()) {
+      _ota_autoinstall_tried = true;
+      char msg[100];
+      oc.apply_fetched(msg);   // arms + sets apply_pending only if signed & allowlisted; refused otherwise
+    }
   }
 #endif
 }
@@ -358,7 +413,10 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       // dedup would suppress those retries and the transfer could never recover from a lost reply.
       // hasSeen() is used ONLY to avoid re-flooding the same packet more than once.
       bool seen = _tables->hasSeen(pkt);
-      ota::ota_ctx().manager.on_message(pkt->payload, pkt->payload_len);  // central OTA receive (all roles)
+      ota::ota_ctx().manager.set_clock(_ms->getMillis());                 // discovery jitter/ages
+      ota::ota_ctx().manager.on_message(pkt->payload, pkt->payload_len);  // central OTA receive (beacon/query/
+                                                                         // have/manifest/data/proof; all roles)
+      ota::ota_ctx().track_session(ota::ota_ctx().manager.fetchState(), _ms->getMillis());
       onOtaRecv(pkt);                                                     // optional per-example hook
       // Re-flood with a hop cap and the LOWEST priority, so OTA never competes with mesh traffic.
       uint8_t n = pkt->getPathHashCount();

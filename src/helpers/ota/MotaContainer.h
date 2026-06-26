@@ -26,6 +26,7 @@ struct MotaManifest {
 
   const uint8_t* merkle_root = nullptr;   // 4
   const uint8_t* image_hash = nullptr;    // 32
+  const uint8_t* hw_id = nullptr;         // 32 (NUL-padded ASCII hardware tag; signed; v2+)
   const uint8_t* base_hash = nullptr;     // 8  (delta only)
   const uint8_t* signer_pubkey = nullptr; // 32 (signed only)
   const uint8_t* signature = nullptr;     // 64 (signed only)

@@ -168,6 +168,10 @@ protected:
   // companion, room, sensor, ...) gets fetch/serve/apply without per-example wiring.
   static void otaSendAdapter(void* ctx, const uint8_t* msg, uint16_t len, bool flood);
   unsigned long _next_ota_tick = 0;
+  unsigned long _next_ota_announce = 0;   // auto-advertise our own fw: boot burst + every OTA_ANNOUNCE_INTERVAL
+  uint8_t       _ota_announce_count = 0;  // adverts sent so far (boot burst before settling to daily)
+  bool          _ota_resumed = false;     // one-shot: resumed an interrupted fetch staged in flash on boot
+  bool          _ota_autoinstall_tried = false;  // attempted auto-install for the current COMPLETE fetch
 #endif
 
   /**

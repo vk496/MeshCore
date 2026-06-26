@@ -115,6 +115,43 @@ void OtaStoreFlashNrf52::finalize() {
   _flushed = true;
 }
 
+// Persist mid-transfer progress so a reboot can resume. Order matters for consistency: flush the open
+// payload page FIRST, then page 0 (the leaf-progress markers) -- so every block whose leaf is now in flash
+// also has its payload in flash. Infrequent (every OTA_CHECKPOINT_BLOCKS blocks), so the 2 extra page
+// erases don't matter; at LoRa block rates it's roughly once per many minutes.
+void OtaStoreFlashNrf52::checkpoint() {
+  if (_total == 0 || _flushed) return;
+  flush_pay();                 // keep _pay_idx open (it may still receive writes); just re-flush its bytes
+  flush_page(0, _meta_page);   // header + manifest + leaves accumulated so far
+}
+
+// Re-attach to a container already staged in flash (after a reboot), without erasing. The container is
+// bottom-aligned (begin: start = (FS_START - total) & ~(PG-1)) and flash is memory-mapped, so scan page
+// starts from just below FS_START down to the app end for MOTA_MAGIC with a self-consistent total; adopt
+// the first match (highest address = most recent for the common single-container case). The manager then
+// parses the loaded manifest and validates geometry/root, so a stale leftover is rejected there.
+bool OtaStoreFlashNrf52::reopen() {
+  uint32_t app_end = MOTA_NRF52_APP_BASE;
+  SelfFwInfo fi;
+  if (ota_self_firmware(fi) && fi.valid) app_end = MOTA_NRF52_APP_BASE + fi.image_len;
+  for (uint32_t start = (MOTA_NRF52_FS_START - PG) & ~(PG - 1); start >= app_end; start -= PG) {
+    const uint8_t* p = (const uint8_t*)(uintptr_t)start;
+    if (memcmp(p, MOTA_MAGIC, 4) != 0) continue;
+    uint32_t total = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+    if (total < 13 || total > capacity()) continue;
+    if (((MOTA_NRF52_FS_START - total) & ~(PG - 1)) != start) continue;   // must match begin()'s placement
+    _write_start = start;
+    _total = total;
+    memcpy(_meta_page, p, PG);                  // load page 0 (header+manifest+leaves) into RAM to continue
+    memcpy(_trailer, p + (total - 5), 5);        // recover the trailer tail (flushed at last finalize, if any)
+    _pay_idx = 0;
+    _flushed = false;
+    OTA_DBG("OTA flash: reopen total=%u start=%08x\n", (unsigned)total, (unsigned)start);
+    return true;
+  }
+  return false;
+}
+
 } // namespace ota
 } // namespace mesh
 

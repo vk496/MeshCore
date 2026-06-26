@@ -62,6 +62,8 @@ public:
   void clear() override { _total = 0; _pay_idx = 0; _flushed = false; }
   bool set_meta_size(uint32_t meta_bytes) override { return meta_bytes <= PG; }  // leaves must fit page 0
   void finalize() override;
+  void checkpoint() override;   // persist page 0 (leaves) + the open payload page so a reboot can resume
+  bool reopen() override;       // re-attach to a container already staged in flash (scan for it)
 
   // Contiguous view (flash is memory-mapped). VALID ONLY AFTER finalize() — before that, page 0 and the
   // tail are still in RAM. OtaManager/OtaCli/verify use this only once the transfer is COMPLETE.

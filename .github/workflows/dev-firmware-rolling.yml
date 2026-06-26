@@ -1,0 +1,101 @@
+# Rolling DEV firmware release (fork convenience).
+#
+# On every push, rebuild ALL device firmwares and replace the assets of ONE rolling prerelease
+# (tag `dev-latest`) so other devs can always grab the current binaries from the same place. Also packages
+# a demo `.mota` (full + a same-image delta, which is tiny) so the OTA format can be exercised.
+#
+# These are UNSIGNED development builds for testing only — not official releases.
+# To limit which branches trigger this, add a `branches:` filter under `push:` below.
+
+name: Dev Firmware (rolling)
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+# Only the latest push matters — cancel any in-flight run so the release tracks HEAD.
+concurrency:
+  group: dev-firmware-rolling
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: dev-latest
+  FIRMWARE_VERSION: dev
+  MOTA_ENV: Heltec_v3_repeater   # representative ESP32 env whose built .bin carries EndF, used for the demo .mota
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v6
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-environment
+
+      # build.sh is best-effort: a board that fails to compile is skipped, the rest still land in out/.
+      # All three roles append to the same out/ directory.
+      - name: Build all firmwares (companion + repeater + room-server)
+        run: |
+          /usr/bin/env bash build.sh build-companion-firmwares
+          /usr/bin/env bash build.sh build-repeater-firmwares
+          /usr/bin/env bash build.sh build-room-server-firmwares
+          echo "Built artifacts:"; ls -la out
+
+      - name: Package demo .mota (full + same-image delta)
+        run: |
+          set -euo pipefail
+          pip install --quiet detools           # delta codec only (a full .mota needs no extra deps)
+          BIN="$(ls out/${MOTA_ENV}-*.bin 2>/dev/null | grep -v -- '-merged' | head -1 || true)"
+          if [ -z "$BIN" ]; then
+            echo "::warning::no ${MOTA_ENV} .bin built — skipping demo .mota"
+          else
+            echo "Using firmware image: $BIN"
+            # full image .mota (codec 0): payload = the flashable image (BODY||EndF)
+            python3 tools/mota/mota.py build --fw "$BIN" --target-env "$MOTA_ENV" \
+              --fw-version 0.0.0 --codec full --out "out/${MOTA_ENV}-demo.full.mota"
+            # delta .mota (codec 1, sequential+crle): base == target == same image -> near-empty patch
+            python3 tools/mota/mota.py build --fw "$BIN" --base "$BIN" --target-env "$MOTA_ENV" \
+              --fw-version 0.0.1 --codec sequential --compression crle --out "out/${MOTA_ENV}-demo.delta.mota"
+            echo "Demo .mota sizes:"; ls -l out/${MOTA_ENV}-demo.*.mota
+          fi
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dev-firmwares
+          path: out
+          if-no-files-found: warn
+          retention-days: 5
+
+      - name: Replace the rolling dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(ls -A out 2>/dev/null)" ]; then
+            echo "::error::nothing built — not touching the release"; exit 1
+          fi
+          # delete the previous release + its tag so old binaries disappear, then recreate at HEAD
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          NOTES=$(cat <<EOF
+          **Automatic development build — latest commit on \`${GITHUB_REF_NAME}\`.**
+
+          - Commit: \`${GITHUB_SHA}\`
+          - Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ⚠️ Unsigned dev builds for testing only. The assets here are replaced on every push (this release
+          always tracks the latest commit). Embedded firmware version string: \`dev-<short-sha>\`.
+
+          \`${MOTA_ENV}-demo.full.mota\` / \`*.delta.mota\` are OTA format demos built from this run's
+          \`${MOTA_ENV}\` image (the delta is a same-image patch, so it is intentionally tiny).
+          EOF
+          )
+          gh release create "$RELEASE_TAG" out/* \
+            --title "Dev firmware (latest commit)" \
+            --notes "$NOTES" \
+            --prerelease \
+            --target "$GITHUB_SHA"

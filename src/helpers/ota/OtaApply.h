@@ -29,14 +29,19 @@ bool ota_apply_set_manifest(const uint8_t* mf, uint32_t len,
 bool ota_apply_verify_slot(ApplyState& st);                              // hash the slot vs image_hash
 bool ota_apply_commit();                                                 // set-boot + reboot (no return)
 
-// Apply a detools-sequential delta `.mota` (whole container in `buf`) using detools' own embeddable
-// C decoder (CODEC_DETOOLS_SEQUENTIAL, --compression crle). The running slot is the delta base; the
-// decoder streams the patch (held in RAM) and writes the reconstructed image into the inactive slot,
-// while we hash the output and check it against the signed manifest image_hash. On success the
-// inactive slot is set as boot partition; the caller then reboots. `msg` (>=80 bytes) receives a
-// human-readable result. Returns true if the slot is verified + armed.
+// Apply an ESP32 A/B `.mota` (CODEC_DETOOLS_SEQUENTIAL delta or CODEC_FULL image) and arm the inactive
+// slot; the caller reboots after the confirmation reply. `msg` (>=80 bytes) receives a human-readable
+// result. With OTA_FLASH_STORE the container is staged in the inactive slot (no contiguous RAM copy): a
+// full payload is already in the slot (just verified), a sequential delta is decoded from the running
+// slot over the staged patch. Without OTA_FLASH_STORE (bring-up) the whole container is a RAM buffer.
+#if defined(ESP32_PLATFORM) && defined(OTA_FLASH_STORE)
+class OtaStoreFlashEsp32;
+bool ota_apply_detools_mota(OtaStoreFlashEsp32& store,
+                            const SignerAllowlist& allow, ApplyState& st, char* msg);
+#else
 bool ota_apply_detools_mota(const uint8_t* buf, uint32_t len,
                             const SignerAllowlist& allow, ApplyState& st, char* msg);
+#endif
 
 // nRF52 (RAK4631) single-slot apply. The running app can't rewrite itself, so it does NOT decode: it
 // runs the gated verification chain (payload hash -> built-for-this-firmware -> signature/trust) and,

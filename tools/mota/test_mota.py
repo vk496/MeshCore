@@ -101,6 +101,31 @@ def test_full_build_parse_verify():
     assert ml.verify(parsed) == []
 
 
+def test_hw_id_roundtrip_and_signed():
+    # the v2 hw_id is a 32-byte NUL-padded ASCII tag in the SIGNED head; it must round-trip + be covered
+    # by the signature (tampering it breaks verification).
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    fw = _fw(77, 4 * 1024)
+    image, _ = ml.ensure_endf(fw)
+    priv = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    m = ml.build_manifest(
+        target_id=0xABCD, fw_version=ml.pack_version("2.0.0"),
+        image_size=len(image), payload=image, block_size=1024,
+        image_hash=ml.mh32(image), codec_id=ml.CODEC_FULL, is_full=True,
+        sign_priv=priv, hw_id="RAK4631")
+    blob = ml.build_container(m, image)
+    parsed = ml.parse_container(blob)
+    assert parsed.manifest.format_ver == 2
+    assert parsed.manifest.hw_id == b"RAK4631" + b"\0" * (32 - 7)
+    assert parsed.manifest.hw_id.rstrip(b"\0").decode() == "RAK4631"
+    assert ml.verify(parsed) == []
+    # flip a byte of the on-wire hw_id -> signature must fail (it's in the signed region)
+    bad = bytearray(blob)
+    hw_off = 8 + 57            # MAGIC(4)+total(4) + fixed head up to codec(57) = start of hw_id
+    bad[hw_off] ^= 0xFF
+    assert ml.verify(ml.parse_container(bytes(bad))) != []
+
+
 def test_tampered_payload_detected():
     fw = _fw(11, 10 * 1024)
     image, _ = ml.ensure_endf(fw)

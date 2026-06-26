@@ -18,8 +18,15 @@ static const uint8_t  ENDF_MAGIC[4]    = { 'E', 'n', 'd', 'F' };   // 45 6E 64 4
 static const uint32_t ENDF_LEN         = 16;                       // marker(4)+body_len(4)+body_hash8(8)
 
 // ---- manifest -------------------------------------------------------------
-static const uint8_t  MOTA_FORMAT_VER  = 1;
+static const uint8_t  MOTA_FORMAT_VER  = 2;      // v2 adds hw_id[32] (a human-readable hardware tag)
 static const uint8_t  HASH_ALGO_SHA256 = 0x12;   // multihash code
+
+// hw_id: a fixed 32-byte, NUL-padded ASCII string naming the hardware a firmware can boot on (e.g.
+// "RAK4631", "Heltec_v3"). Same hw_id == bootable-compatible (a role switch on the same board keeps it;
+// different MCU/board differs). It sits in the SIGNED region of the manifest, so it can't be tampered.
+// The applier refuses a `.mota` whose hw_id differs from the device's own (brick-safety, esp. for a manual
+// cross-target `ota dev want`). An empty hw_id on either side = "unknown", and the check is skipped.
+static const uint8_t  MOTA_HW_ID_LEN   = 32;
 
 static const uint8_t  MFLAG_FULL       = 0x01;   // 0 = delta/partial, 1 = full image
 static const uint8_t  MFLAG_SIGNED     = 0x02;
@@ -46,8 +53,10 @@ enum OtaMsgType : uint8_t {
   OTA_HAVE         = 0x03,
   OTA_GET_MANIFEST = 0x04,
   OTA_MANIFEST     = 0x05,
-  OTA_REQ          = 0x06,
-  OTA_DATA         = 0x07,
+  OTA_REQ          = 0x06,   // request a window of blocks' DATA fragments
+  OTA_DATA         = 0x07,   // one fragment of a block's data (self-describing by frag_off; no proof)
+  OTA_REQ_PROOF    = 0x08,   // request the merkle proof for one block (data + proof are fetched separately)
+  OTA_PROOF        = 0x09,   // the merkle proof for one block
 };
 
 static const uint16_t OTA_DEFAULT_BLOCK_SIZE = 1024;

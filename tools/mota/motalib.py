@@ -9,7 +9,7 @@ The wire format (all integers little-endian):
 
     manifest  = format_ver(1) flags(1) hash_algo(1) target_id(4) fw_version(4)
                 image_size(4) payload_size(4) block_size_log2(1) merkle_root(4)
-                image_hash(32) codec_id(1)
+                image_hash(32) codec_id(1) hw_id(32)
                 [base_hash(8) if delta] [signer_pubkey(32) signature(64) if signed]
                 approval(4) leaves[](4*BC)
 
@@ -33,7 +33,7 @@ TRAILER = b"vk496"        # 76 6B 34 39 36
 ENDF_MAGIC = b"EndF"      # 45 6E 64 46
 ENDF_LEN = 16             # marker(4) + body_len(4) + body_hash8(8)
 
-FORMAT_VER = 1
+FORMAT_VER = 2          # v2 adds hw_id[32] (a NUL-padded ASCII hardware tag) in the signed head
 HASH_ALGO_SHA256 = 0x12   # multihash code for sha2-256
 
 FLAG_FULL = 0x01
@@ -237,6 +237,7 @@ class Manifest:
     merkle_root: bytes = b"\0\0\0\0"
     image_hash: bytes = b"\0" * 32
     codec_id: int = CODEC_FULL
+    hw_id: bytes = b"\0" * 32                  # 32-byte NUL-padded ASCII hardware tag (signed)
     base_hash: Optional[bytes] = None         # 8 bytes, delta only
     signer_pubkey: Optional[bytes] = None     # 32 bytes, signed only
     signature: Optional[bytes] = None         # 64 bytes, signed only
@@ -269,6 +270,7 @@ class Manifest:
         out += self.merkle_root
         out += self.image_hash
         out += bytes([self.codec_id])
+        out += self.hw_id                      # 32-byte hardware tag (part of the signed head)
         if not self.is_full:
             out += self.base_hash
         if self.is_signed:
@@ -285,9 +287,20 @@ class Manifest:
         return bytes(out)
 
 
+def hw_id_bytes(s) -> bytes:
+    """Pack a hardware tag (str or bytes) into the fixed 32-byte NUL-padded field."""
+    if s is None:
+        return b"\0" * 32
+    raw = s.encode("ascii") if isinstance(s, str) else bytes(s)
+    if len(raw) > 32:
+        raise ValueError("hw_id must be <= 32 bytes")
+    return raw + b"\0" * (32 - len(raw))
+
+
 def _validate_lengths(m: Manifest):
     assert len(m.merkle_root) == 4
     assert len(m.image_hash) == 32
+    assert len(m.hw_id) == 32
     assert len(m.approval) == 4
     if not m.is_full:
         assert m.base_hash is not None and len(m.base_hash) == 8, "delta requires 8-byte base_hash"
@@ -298,7 +311,7 @@ def _validate_lengths(m: Manifest):
 
 def build_manifest(*, target_id: int, fw_version: int, image_size: int, payload: bytes,
                    block_size: int, image_hash: bytes, codec_id: int, is_full: bool,
-                   base_hash: Optional[bytes] = None, sign_priv=None) -> Manifest:
+                   base_hash: Optional[bytes] = None, sign_priv=None, hw_id=None) -> Manifest:
     assert (block_size & (block_size - 1)) == 0, "block_size must be a power of two"
     leaves = leaf_hashes(payload, block_size)
     m = Manifest(
@@ -311,6 +324,7 @@ def build_manifest(*, target_id: int, fw_version: int, image_size: int, payload:
         merkle_root=merkle_root(leaves),
         image_hash=image_hash,
         codec_id=codec_id,
+        hw_id=hw_id_bytes(hw_id),
         base_hash=None if is_full else base_hash,
         leaves=leaves,
     )
@@ -367,6 +381,7 @@ def parse_container(blob: bytes) -> Parsed:
     m.merkle_root = take(4)
     m.image_hash = take(32)
     m.codec_id = take(1)[0]
+    m.hw_id = take(32)
     if not m.is_full:
         m.base_hash = take(8)
     if m.is_signed:

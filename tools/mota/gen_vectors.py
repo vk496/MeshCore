@@ -30,7 +30,7 @@ def build_full():
     m = ml.build_manifest(
         target_id=0x11223344, fw_version=ml.pack_version("1.16.0"),
         image_size=len(image), payload=image, block_size=1024,
-        image_hash=ml.mh32(image), codec_id=ml.CODEC_FULL, is_full=True)
+        image_hash=ml.mh32(image), codec_id=ml.CODEC_FULL, is_full=True, hw_id="TESTHW")
     return ml.build_container(m, image), m, image
 
 
@@ -86,6 +86,7 @@ def main():
         f"static const uint8_t  EXP_CODEC_ID = {m.codec_id};",
         _carr("EXP_MERKLE_ROOT", m.merkle_root),
         _carr("EXP_IMAGE_HASH", m.image_hash),
+        _carr("EXP_HW_ID", m.hw_id),
         f"static const uint32_t PROOF_INDEX = {proof_idx}u;",
         f"static const uint8_t  PROOF_NSIB = {len(siblings)//4};",
         _carr("PROOF_SIBLINGS", siblings),
@@ -118,6 +119,18 @@ def main():
     lines.append(_carr("SIM_MOTA", sim_blob))
     lines.append(f"static const uint32_t SIM_MOTA_LEN = {len(sim_blob)};")
     lines.append(f"static const uint32_t SIM_TARGET_ID = 0x{sm.target_id:08x}u;")
+
+    # 1 KB-block signed .mota: each logical block spans MULTIPLE LoRa DATA fragments (1024 / 160 = 7),
+    # so this exercises the multi-fragment reassembly + split proof path the device actually uses.
+    sm1k = ml.build_manifest(target_id=0xCAFEBABE, fw_version=ml.pack_version("3.0.0"),
+                             image_size=len(sim_image), payload=sim_image, block_size=1024,
+                             image_hash=ml.mh32(sim_image), codec_id=ml.CODEC_FULL,
+                             is_full=True, sign_priv=sim_priv)
+    sim1k_blob = ml.build_container(sm1k, sim_image)
+    lines.append("// 1 KB-block signed .mota (multi-fragment per block) for the reassembly transfer test")
+    lines.append(_carr("SIM_MOTA_1K", sim1k_blob))
+    lines.append(f"static const uint32_t SIM_MOTA_1K_LEN = {len(sim1k_blob)};")
+    lines.append(f"static const uint32_t SIM_MOTA_1K_BLOCKS = {sm1k.block_count};")
 
     # detools sequential+crle delta vector: base image, the real detools 0.53.0 patch, and the
     # expected target image. The native test applies DT_PATCH to DT_BASE with the *vendored detools

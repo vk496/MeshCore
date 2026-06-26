@@ -74,6 +74,16 @@ public:
     return 0;
   #endif
   }
+  // Human-readable hardware tag (<=32 ASCII chars, e.g. "RAK4631") naming the hardware this firmware can
+  // boot on. Same tag == bootable-compatible; the OTA applier refuses a `.mota` whose hw_id differs (brick-
+  // safety). Defined per-variant via the MOTA_HW_ID build flag; "" when unset (then the check is skipped).
+  virtual const char* getOtaHwId() const {
+  #ifdef MOTA_HW_ID
+    return MOTA_HW_ID;
+  #else
+    return "";
+  #endif
+  }
 #endif
 
   // Power management interface (boards with power management override these)

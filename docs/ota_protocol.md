@@ -1,63 +1,103 @@
-# MeshCore OTA — `.mota` container & LoRa protocol (v1 draft)
+# MeshCore OTA — `.mota` container & LoRa protocol (v2)
 
-Goals: distribute firmware over LoRa as a self-verifying, resumable, BitTorrent-v2-style block
-transfer that survives reboots, never auto-applies without consent, and is portable enough for other
-projects (e.g. Meshtastic) to adopt.
+This is the **single source of truth** for MeshCore's over-the-air firmware update system ("mOTA"). It is
+written for developers who want to implement an interoperable peer (server, fetcher, relay, or host tool)
+in another codebase or project. Everything below is implemented and hardware-verified in this repository;
+where a section names a source file, that file is the authoritative reference for byte-level details.
+
+**Design goals**
+
+- Distribute firmware over LoRa as a **self-verifying, resumable, BitTorrent-style block transfer** that
+  survives reboots and never auto-applies without explicit consent.
+- **Trustless transport / relay:** any node may carry or relay any block; integrity is content-addressed
+  against a signed merkle root, so a relay need not be trusted and never needs the signing keys.
+- **Lowest priority, always:** OTA traffic is enqueued behind all mesh traffic — "eventually upgradable".
+  A busy node delays OTA indefinitely rather than competing with real traffic.
+- **Portable:** the engine (`src/helpers/ota/OtaManager`) is Arduino/radio/crypto-free and host-testable,
+  so the same logic drives a device, a simulation, or a third-party implementation.
+
+**Source map** (all under `src/helpers/ota/` unless noted)
+
+| Concern | File |
+|---|---|
+| Constants, enums, flags | `OtaFormat.h` |
+| Container/manifest parse | `MotaContainer.{h,cpp}` |
+| Merkle tree + proofs | `MerkleTree.{h,cpp}` |
+| EndF self-identity | `FirmwareInfo.{h,cpp}` |
+| Wire message codec | `OtaProtocol.{h,cpp}` |
+| Session engine (serve+fetch+discovery) | `OtaManager.{h,cpp}` |
+| Multi-mota / folder relay | `OtaSource.h`, `MotaSourceSerial.{h,cpp}`, `MotaSeederProto.h` |
+| Staging stores | `OtaStore.h`, `OtaStoreFlashNrf52.*`, `OtaStoreFlashEsp32.*` |
+| Apply | `OtaApply.*`, bootloader `Adafruit_nRF52_Bootloader_OTAFIX` |
+| Device glue (CLI/context) | `OtaCli.cpp`, `OtaContext.h` |
+| Host tooling | `tools/mota/` (`mota.py`, `motalib.py`, `mota_seeder.py`) |
 
 ---
 
 ## 1. Conventions
 
 - **Endianness:** all multi-byte integers are little-endian unless stated.
-- **Hashes (multihash):** the hash family is declared once per manifest via `hash_algo`. v1 uses
+- **Hashes (multihash):** the hash family is declared once per manifest via `hash_algo`. v2 uses
   `0x12` = **SHA-256** (the [multihash](https://github.com/multiformats/multihash) code for sha2-256).
   Truncations used:
-  - `sha2-256:4` — first 4 bytes of the SHA-256 digest. Merkle leaves, internal nodes, root, proofs.
-  - `sha2-256:8` — first 8 bytes. Base-firmware identity (`base_hash`, `EndF`).
+  - `sha2-256:4` — first 4 bytes of the SHA-256 digest. Merkle leaves, internal nodes, root, proofs,
+    `manifest_id`, and the discovery `set_digest`.
+  - `sha2-256:8` — first 8 bytes. Base-firmware identity (`base_hash`, `EndF.body_hash`).
   - `sha2-256:32` — full digest. The image security anchor (`image_hash`).
   Digests are stored **bare** (just the truncated bytes); the family is implied by `hash_algo`.
 - **Signatures:** Ed25519 (RFC 8032), 64-byte detached signature, 32-byte public key.
 
-Reference constants:
+**Reference constants** (`OtaFormat.h`):
 
-| Name | Bytes (hex) | ASCII |
+| Name | Value | ASCII / note |
 |---|---|---|
 | Container `MAGIC` | `6D 4F 54 41` | `mOTA` |
 | Container `TRAILER` | `76 6B 34 39 36` | `vk496` |
 | `EndF` marker | `45 6E 64 46` | `EndF` |
-| `hash_algo` (sha2-256) | `12` | — |
-| `approval` = not approved | `FF FF FF FF` | (erased) |
+| `hash_algo` (sha2-256) | `0x12` | multihash code |
+| `format_ver` | `0x02` | this spec |
+| `approval` = not approved | `FF FF FF FF` | erased NOR word |
 | `approval` = approved | `41 50 52 56` | `APRV` |
-| `format_ver` | `01` | — |
+| `MFLAG_FULL` | `0x01` | flags bit0 |
+| `MFLAG_SIGNED` | `0x02` | flags bit1 |
+| `CODEC_FULL` / `_SEQUENTIAL` / `_INPLACE` | `0` / `1` / `2` | §5 |
+| `PAYLOAD_TYPE_OTA` | `0x0C` | MeshCore packet type (`src/Packet.h`) |
+| `MAX_PACKET_PAYLOAD` | `184` | usable bytes per packet (`src/MeshCore.h`) |
+| Default block size | `1024` | `block_size_log2 = 0x0A` |
+| OTA TX priority | `250` | lowest (`OTA_TX_PRIORITY`, `src/Mesh.h`) |
 
 ---
 
 ## 2. Firmware image & the `EndF` trailer
 
-Every OTA-capable firmware build appends a 16-byte `EndF` trailer to its flashed image so a running
-node can discover its own size/identity on any MCU (no linker symbols needed).
+Every OTA-capable build appends a 16-byte `EndF` trailer to its flashed image so a running node can
+discover its own size/identity on any MCU (no linker symbols needed). Implemented by
+`FirmwareInfo.cpp`; appended at build time by `tools/mota/pio_endf.py` (post-build hook).
 
 ```
 flashed image = BODY (image bytes) || EndF trailer
 EndF trailer (16 bytes):
-  off 0  4  "EndF"        (45 6E 64 46)
+  off 0  4  "EndF"        45 6E 64 46
   off 4  4  body_len      uint32 LE — length of BODY (excludes this 16-byte trailer)
-  off 12 8  body_hash     sha2-256:8 of BODY
+  off 8  8  body_hash     sha2-256:8 of BODY
 ```
 
-- **Size discovery:** scan flash from the partition top downward for the `EndF` marker; the byte
-  before it is the last BODY byte. (Same technique as `NRF52Board::getBootloaderVersion`.)
-- **Self-identity / delta base matching:** a node's `body_hash` is read directly from its own `EndF`;
-  a delta's `base_hash` (§5) must equal it. No self-hashing pass required at match time.
+- **Size discovery:** scan flash from the partition top downward for the `EndF` marker; the byte before
+  it is the last BODY byte. (See `ota_self_firmware()`.)
+- **Delta base matching:** a node's `body_hash` is read directly from its own `EndF`; a delta's
+  `base_hash` (§5) must equal it. No self-hashing pass at match time.
 - **No circularity:** `EndF` hashes only the BODY, never itself.
 
 The "reconstructed image" referenced by the manifest is the full `BODY || EndF` (what gets flashed).
+
+> **Implementer note:** the bootloader (and any non-Arduino consumer) MUST locate the body extent by
+> scanning for `EndF`, never by trusting a stored size — see the bootloader contract in §12.
 
 ---
 
 ## 3. The `.mota` container
 
-This is the **distributed** form (host-built, wire-transferred).
+The distributed form (host-built, wire-transferred). Parsed by `mota_parse()` in `MotaContainer.cpp`.
 
 ```
 off            size   field
@@ -70,62 +110,66 @@ off            size   field
 8 + M + P      5      TRAILER = 76 6B 34 39 36
 ```
 
-`MOTA_TOTAL_SIZE = 4 + 4 + M + P + 5`.
+`MOTA_TOTAL_SIZE = 4 + 4 + M + P + 5`. The manifest `M` **includes** `leaves[]`; the manifest-minus-leaves
+prefix (`mfl`, sent over the wire as `OTA_MANIFEST`) is `[8, leaves_off)`.
 
 **Staged (in-flash) form.** Written bottom-aligned so `TRAILER` ends at `staging_region_end`. Identical
-bytes, except the device mutates two regions in place (both NOR-safe, no re-erase): the `leaves[]`
-slots (filled as blocks arrive) and the 4-byte `approval` field (on user approval). Everything else is
-immutable.
+bytes, except the device mutates two regions in place (both NOR-safe, no re-erase): the `leaves[]` slots
+(filled as blocks arrive — §7) and the 4-byte `approval` field (on owner consent — §4.2). Everything else
+is immutable.
 
 ---
 
 ## 4. The manifest
 
-Fields are serialized in this exact order. Conditional fields are present per `flags`.
+Fields serialized in this exact order; conditional fields present per `flags`. Fixed head is **89 bytes**
+(through `hw_id`). Parsed by `mota_parse_manifest()`.
 
 ```
 off  size   field            notes
-0    1      format_ver       = 0x01
-1    1      flags            bit0 FULL (0=delta/partial, 1=full image)
-                             bit1 SIGNED
-                             bits2-7 reserved (0)
+0    1      format_ver       = 0x02
+1    1      flags            bit0 FULL (0=delta/partial, 1=full image); bit1 SIGNED; bits2-7 reserved 0
 2    1      hash_algo        0x12 = sha2-256
 3    4      target_id        device/arch/role discriminator (§9)
 7    4      fw_version       MAJOR<<24 | MINOR<<16 | PATCH<<8 | pre   (comparable uint32)
 11   4      image_size       size of the reconstructed image (BODY||EndF)
 15   4      payload_size     PAYLOAD bytes in this container
 19   1      block_size_log2  e.g. 0x0A = 1024
-20   4      merkle_root      sha2-256:4 over PAYLOAD blocks (§6)
+20   4      merkle_root      sha2-256:4 over PAYLOAD blocks (§6) — also the manifest_id
 24   32     image_hash       sha2-256:32 of the reconstructed image — SECURITY anchor
 56   1      codec_id         0=full/raw, 1=detools-sequential, 2=detools-in-place
-57   8      base_hash        [present iff !FULL] sha2-256:8 of the BASE image's BODY (matches EndF.body_hash)
-.    32     signer_pubkey    [present iff SIGNED] Ed25519 public key
-.    64     signature        [present iff SIGNED] Ed25519 over all bytes from off 0 up to here (exclusive)
+57   32     hw_id            NUL-padded ASCII hardware tag (e.g. "RAK4631"); same tag => bootable-compatible.
+                             SIGNED. Applier refuses a mismatch (brick-safety); empty on either side = skip.
+--- end of fixed 89-byte head ---
+89   8      base_hash        [iff !FULL] sha2-256:8 of the BASE image's BODY (== that build's EndF.body_hash)
+.    32     signer_pubkey    [iff SIGNED] Ed25519 public key
+.    64     signature        [iff SIGNED] Ed25519 over all bytes from off 0 up to here (exclusive)
 .    4      approval         ALWAYS present. FF FF FF FF = not approved; 41 50 52 56 ("APRV") = approved
+--- end of manifest-minus-leaves (mfl); leaves_off = 8 + mfl in the container ---
 .    4*BC   leaves[]         ALWAYS present. BC = ceil(payload_size / 2^block_size_log2). sha2-256:4 each
 ```
 
-Self-delimiting: a parser knows every offset from `format_ver`/`flags` + `payload_size` (→ `BC`); no
-explicit length field is stored.
+Self-delimiting: every offset is known from `flags` + `payload_size` (→ `BC`); no length field is stored.
 
-Manifest size (excluding `leaves[]`): unsigned-full 57+4=61, signed-full 161, unsigned-delta 69,
-**signed-delta 165**.
+Manifest-minus-leaves size (`mfl`): unsigned-full `89+4 = 93`, signed-full `189`, unsigned-delta `101`,
+**signed-delta `197`**. A signed manifest exceeds one packet, so `OTA_MANIFEST` is sent multi-fragment
+(§8.4) and reassembled by the fetcher.
 
 ### 4.1 Signed region
 
-`signature` covers manifest bytes `[0, signature_offset)` — i.e. everything before it, including
-`signer_pubkey` and (for deltas) `base_hash`. It does **not** cover `approval` or `leaves[]`:
+`signature` covers manifest bytes `[0, signature_offset)` — everything before it, including `signer_pubkey`
+and (for deltas) `base_hash`. It does **not** cover `approval` or `leaves[]`:
+
 - `leaves[]` are verified against the signed `merkle_root` (§6), so they need no separate signature.
-- `approval` is device-local consent (§7), deliberately outside the signature.
+- `approval` is device-local consent (§4.2), deliberately outside the signature.
 
 ### 4.2 The `approval` field
 
 - Distributed and **forced on ingest** to `FF FF FF FF` (a peer can never pre-approve).
-- The local user's `ota apply` writes `41 50 52 56` (`"APRV"`) — a single NOR-safe write (only clears
+- The local owner's `ota applydelta` writes `41 50 52 56` (`"APRV"`) — a single NOR-safe write (only clears
   bits from the erased word). Any partial/other value reads as not-approved (fail-safe).
-- Auto-bound to this image: it lives in this `.mota`'s manifest and is re-erased when a new `.mota` is
-  staged.
-- It is a **consent** marker, not a security primitive. Authenticity = `signature` + `image_hash`.
+- Bound to this image (lives in this `.mota`'s manifest, re-erased when a new `.mota` is staged).
+- A **consent** marker, not a security primitive. Authenticity = `signature` + `image_hash` + `hw_id`.
 
 ---
 
@@ -133,44 +177,45 @@ Manifest size (excluding `leaves[]`): unsigned-full 57+4=61, signed-full 161, un
 
 `PAYLOAD` is either the full reconstructed image (`FULL`) or a delta (`!FULL`).
 
-| `codec_id` | Meaning | Notes |
+| `codec_id` | Meaning | Used by |
 |---|---|---|
-| 0 | full / raw | PAYLOAD = reconstructed image (`BODY||EndF`). Typical for ESP32 (A/B). |
-| 1 | detools sequential | needs random read of base + sequential write of result (e.g. ESP32 A→B). |
-| 2 | detools in-place | bounded scratch; rewrites the app region in place (nRF52 single-slot). |
+| 0 | full / raw | PAYLOAD = reconstructed image (`BODY‖EndF`). ESP32 A/B (and any board for a full image). |
+| 1 | detools **sequential** | random read of base + sequential write of result → ESP32 A→B inactive slot. |
+| 2 | detools **in-place** | bounded scratch; rewrites the app region in place → nRF52 single-slot. |
 
-For deltas, `base_hash` = the base image's `EndF.body_hash` (sha2-256:8 of its BODY). A node applies a
+For deltas, `base_hash` = the base build's `EndF.body_hash` (sha2-256:8 of its BODY). A node applies a
 delta only if `base_hash` matches its own `EndF.body_hash`. After applying, the result MUST hash
-(sha2-256:32) to `image_hash` before it is flashed — this is the hard security gate.
+(sha2-256:32) to `image_hash` before it is booted — the hard security gate.
 
-Compression is internal to the detools patch; the chosen scheme must be supported by the applier
-(bootloader contract, §12). Patches are produced by detools 0.53.0 (`tools/mota` → `detools.create_patch`)
-and decoded on-device by detools' own embeddable C decoder, vendored verbatim at
-`src/helpers/ota/detools/` (see its `README.meshcore.txt`). That build enables only the self-contained
-`NONE` + `CRLE` compressions (no malloc / liblzma / heatshrink), so MeshCore deltas use
-`--codec sequential --compression crle`. The ESP32 applier (`OtaApply.cpp::ota_apply_detools_mota`)
-wires the decoder's callbacks to: read base ← running OTA slot, stream patch ← fetched bytes in RAM,
-write output → inactive slot, hashing the output and checking it against `image_hash` before arming.
+**A fetcher only requests firmware it can apply.** Each node declares the codec(s) it can apply
+(`set_apply_codec`/`set_apply_codec2`): ESP32 accepts `full` + `sequential` (+ `in-place`), nRF52 accepts
+`full` + `in-place`. `CODEC_FULL` is always acceptable. A `.mota` with an unsupported codec is rejected at
+discovery time, before any blocks are requested.
+
+Compression is internal to the detools patch and must be supported by the applier. Patches are produced by
+**detools 0.53.0** (`tools/mota` → `detools.create_patch`) and decoded on-device by detools' embeddable C
+decoder, vendored verbatim at `src/helpers/ota/detools/` (see its `README.meshcore.txt`). That build
+enables only the self-contained `NONE` + `CRLE` compressions (no malloc/liblzma/heatshrink), so MeshCore
+deltas use `--compression crle`. **Do not reimplement the codec** — use the vendored decoder.
 
 ---
 
 ## 6. Merkle tree (sha2-256:4)
 
-Purpose: verify each PAYLOAD block against the signed `merkle_root` **before** the whole payload
-exists, so corruption/forgery is localized to a block.
+Verifies each PAYLOAD block against the signed `merkle_root` **before** the whole payload exists, so
+corruption/forgery is localized to a block. Implemented in `MerkleTree.cpp`.
 
-- **Blocks:** PAYLOAD is split into `BC = ceil(payload_size / B)` blocks, `B = 2^block_size_log2`
-  (default 1024). The last block is its real length (**no zero padding**).
+- **Blocks:** PAYLOAD splits into `BC = ceil(payload_size / B)` blocks, `B = 2^block_size_log2` (default
+  1024). The last block is its real length (**no zero padding**).
 - **Leaf:** `leaves[i] = sha2-256:4( block_i_bytes )`.
-- **Internal node:** `node = sha2-256:4( left || right )` (4+4 = 8 input bytes).
-- **Odd level:** if a level has an odd number of nodes, the **last node is promoted unchanged** to the
-  next level (no duplication).
+- **Internal node:** `node = sha2-256:4( left ‖ right )` (4+4 input bytes).
+- **Odd level:** an odd count promotes the **last node unchanged** to the next level (no duplication).
 - **Root:** reduce until one node remains. `BC == 1` → root = `leaves[0]`. `BC == 0` is invalid.
 
 ### 6.1 Proofs
 
-A proof for block `i` is the ordered list of sibling digests from leaf to root, each tagged
-left/right. Promoted levels contribute **no** element. Verification (needs `BC` to know the shape):
+A proof for block `i` is the ordered list of sibling digests from leaf to root. Promoted levels contribute
+**no** element. Verification (needs `BC` to know the tree shape):
 
 ```
 h = leaf_i ; idx = i ; n = BC ; p = 0
@@ -179,110 +224,287 @@ while n > 1:
         pass
     else:
         sib, side = proof[p] ; p += 1
-        h = sha2-256:4( sib || h ) if side==left else sha2-256:4( h || sib )
+        h = sha2-256:4( sib ‖ h ) if side==left else sha2-256:4( h ‖ sib )
     idx //= 2 ; n = (n + 1) // 2
 accept iff h == merkle_root and p == len(proof)
 ```
 
-Over LoRa, `leaves[]` are **omitted** from the manifest transfer; a serving node computes a block's
-proof on demand from its stored `leaves[]`, and the fetcher fills its own `leaves[i]` as each verified
-block lands.
+Over LoRa, `leaves[]` are **omitted** from the manifest transfer; a serving node computes a block's proof
+on demand from its stored `leaves[]` (`OTA_REQ_PROOF`/`OTA_PROOF`, §8.5), and the fetcher fills its own
+`leaves[i]` as each verified block lands.
 
 ---
 
-## 7. Block availability (persistent, derived from `leaves[]`)
+## 7. Block availability, staging & resume
 
 There is no separate availability structure. **Block `i` is present ⟺ `leaves[i]` is non-erased**
-(`!= FF FF FF FF`). Because `leaves[]` live in the staged flash region, availability **survives
-reboot**. Commit order per block (crash-safe): (1) verify proof, (2) write block payload to its
-offset, (3) write `leaves[i]` **last**. A power loss before step 3 leaves the slot erased → the block
-is simply re-fetched (idempotent). On boot a node rebuilds a small in-RAM bitmap (`ceil(BC/8)` bytes)
-by scanning `leaves[]`.
+(`!= FF FF FF FF`). Because `leaves[]` live in the staged flash region, availability **survives reboot**.
 
-A node holding the complete payload (or relaying/serving its own firmware) advertises `have_all`
-instead of a bitmap.
+**Commit order per block (crash-safe):** (1) verify proof, (2) write block payload to its offset, (3) write
+`leaves[i]` **last**. A power loss before step 3 leaves the slot erased → the block is simply re-fetched
+(idempotent). On boot a node rebuilds an in-RAM present-bitmap by scanning `leaves[]`.
+
+**Resume (`OtaManager::resumeStaged` + `OtaStore::checkpoint`/`reopen`):** an interrupted fetch resumes from
+the staged container after a reboot — re-parse the stored manifest, recompute geometry, count present
+blocks, continue fetching the holes (or jump straight to COMPLETE). The checkpoint cadence (persist progress
+every N committed blocks) is runtime-tunable (`ota config checkpoint <N>`, 0 = only finalized containers
+resume). Stores keep `leaves[]` in RAM until flush and never auto-GC, preserving resumable progress.
+
+**Flash-store note (RX-safe writes):** a flash page-erase halts the CPU (~85 ms on nRF52) and starves LoRa
+RX, so the flash stores (`OtaStoreFlashNrf52`/`OtaStoreFlashEsp32`) **coalesce writes to the erase unit**
+(4 KB page / sector) and commit each once off the per-packet path — RAM stays O(one page), not O(image). A
+small delta that fits page 0 does zero flash I/O until COMPLETE.
 
 ---
 
 ## 8. LoRa OTA protocol
 
-Carried in MeshCore packets with **`PAYLOAD_TYPE_OTA = 0x0C`** (subject to change if core devs prefer
-reusing `RAW_CUSTOM 0x0F` + subtype). Every OTA packet payload:
+Carried in MeshCore packets with **`PAYLOAD_TYPE_OTA = 0x0C`**. Every OTA packet payload is:
 
 ```
-[0]    ota_msg_type
-[1..]  body
+[0]    ota_msg_type      (OtaMsgType, OtaFormat.h)
+[1..]  body              (fixed per type; encode/decode in OtaProtocol.cpp)
 ```
 
-- **Routing:** `OTA_ADV`/`OTA_QUERY` flood; `OTA_HAVE`/`OTA_MANIFEST`/`OTA_REQ`/`OTA_DATA` direct.
-- **Hop cap:** OTA refuses to retransmit when `getPathHashCount() >= ota_hop_limit` (default **3**,
-  configurable). No change to core routing.
-- **Priority:** enqueued at the lowest TX priority (~250) and only when the duty-cycle/airtime budget
-  has spare headroom, so OTA never competes with mesh traffic.
-- **`manifest_id`** = the manifest's `merkle_root` (4 bytes) — a compact content id.
+Message types:
 
-| `ota_msg_type` | val | dir | body |
+| `ota_msg_type` | val | routing | purpose |
 |---|---|---|---|
-| `OTA_ADV` | 0x01 | flood | `target_id(4) fw_version(4) image_size(4) block_size_log2(1) merkle_root(4) image_hash8(8) flags(1) [base_hash(8) if delta] have_all(1)` |
-| `OTA_QUERY` | 0x02 | flood | `target_id(4) min_version(4) caps(1)` (caps bit0 want_delta, bit1 want_full) |
-| `OTA_HAVE` | 0x03 | direct | `manifest_id(4) bitmap_off(2) bitmap[]` |
-| `OTA_GET_MANIFEST` | 0x04 | direct | `manifest_id(4)` |
-| `OTA_MANIFEST` | 0x05 | direct | `manifest_id(4) frag_idx(1) frag_total(1) bytes[]` (omits `leaves[]`) |
-| `OTA_REQ` | 0x06 | direct | `manifest_id(4) want_off(2) want_bitmap[]` |
-| `OTA_DATA` | 0x07 | direct | `manifest_id(4) block_idx(2) frag_idx(1) frag_total(1) [proof in frag0] bytes[]` |
+| `OTA_ADV`          | 0x01 | flood  | tiny per-node beacon (discovery tier 1) |
+| `OTA_QUERY`        | 0x02 | flood  | ask a source for its catalog (discovery tier 2) |
+| `OTA_HAVE`         | 0x03 | flood  | the catalog reply (fragmented, digest-tagged) |
+| `OTA_GET_MANIFEST` | 0x04 | direct | request a manifest by `manifest_id` |
+| `OTA_MANIFEST`     | 0x05 | direct | the manifest-minus-leaves, fragmented |
+| `OTA_REQ`          | 0x06 | direct | request a window of blocks' DATA |
+| `OTA_DATA`         | 0x07 | direct | one self-describing fragment of a block's data |
+| `OTA_REQ_PROOF`    | 0x08 | direct | request the merkle proof for one block |
+| `OTA_PROOF`        | 0x09 | direct | the merkle proof for one block |
 
-Sizing against the 184-byte `MAX_PACKET_PAYLOAD`: `OTA_DATA` fixed overhead ≈ 9 B → ~175 B/fragment →
-**6 fragments per 1 KB block**; a proof for ≤512 blocks ≤ 9×4 = 36 B (carried in `frag0`); an
-availability bitmap for 500 blocks ≈ 63 B (one packet).
+- **`manifest_id`** = the manifest's `merkle_root` (4 bytes) — a compact content id present in every
+  transfer message, so a multi-mota server dispatches each request to the right image.
+- **Priority:** all OTA packets enqueue at `OTA_TX_PRIORITY = 250` (lowest). OTA never competes with mesh
+  traffic; on a busy node it is delayed indefinitely.
+- **Reliability is *eventual*:** the fetcher re-requests missing fragments/blocks after a timeout, possibly
+  from a different peer. No hard ACKs, no global ordering.
+- **Relay:** replies are flooded, so transparent relay needs no per-requester addressing, and the transfer
+  is trustless (the fetcher verifies every block against the signed root). Any neighbor may serve any
+  fragment it has.
 
-Reliability is *eventual*: the fetcher re-requests un-acked blocks after a timeout, possibly from a
-different peer. No hard ACKs, no ordering.
+### 8.1 Two-tier discovery
 
-### 8.1 Relay seeding (companion frames)
+Because a node may serve **many** mOTAs (its own firmware plus an external folder — §10), discovery is split
+so the periodic beacon stays tiny regardless of catalog size:
 
-A node need not store a foreign-target `.mota` to serve it: a relay advertises a manifest on behalf of
-an external source and **pulls blocks on demand**. Companion-app frames: `CMD_OTA_PROVIDE_MANIFEST`
-(app→node, starts advertising), event `PUSH_OTA_BLOCK_REQ(manifest_id, block_idx)` (node→app), reply
-`CMD_OTA_PROVIDE_BLOCK(manifest_id, block_idx, bytes)`.
+**Tier 1 — `OTA_ADV` beacon** (10 bytes, constant, flooded periodically):
+
+```
+seeder_id[4]    advertiser node id = pubkey[0:4]; the QUERY address + distinct-source id
+n_motas         uint8 — count of complete servable mOTAs (saturates at 255)
+set_digest[4]   sha2-256:4 over the SORTED set of served manifest_ids (see below)
+```
+
+`set_digest` is a **content hash of the offering**, not a counter: canonical across nodes, and it changes
+iff the set of served mids changes. A peer that has already catalogued this `{seeder, set_digest}` ignores
+the beacon (steady state is query-free). For a single served mota, `set_digest = sha2-256:4(mid)`.
+
+**Tier 2 — `OTA_QUERY` → `OTA_HAVE`** (on interest only):
+
+```
+OTA_QUERY  (flood):  seeder_id[4]  set_digest[4]  filter_target(uint32)   # filter_target 0 = everything
+OTA_HAVE   (flood):  seeder_id[4]  set_digest[4]  frag_idx(1) frag_total(1) n_rows(1)  rows[]
+  HaveRow (14 bytes, OTA_HAVE_ROW_BYTES): mid[4] target_id(4) fw_version(4) codec_id(1) flags(1)
+```
+
+A node interested in a source's offering schedules a QUERY; the source replies with its full catalog as
+`OTA_HAVE` rows (fragmented if they exceed one packet — up to 12 rows per fragment). The heavy manifest is
+fetched per-mid only on commit (§8.3).
+
+### 8.2 Anti-storm (mandatory at mesh scale)
+
+If 50 neighbours all queried a new beacon at once, the mesh would collapse. Mitigations (gossip/mDNS
+pattern), all in `OtaManager`:
+
+- **`OTA_HAVE` is flooded and digest-tagged.** EVERY node that overhears it caches the rows **passively**
+  (keyed by `{seeder, set_digest}`) — no query of its own needed.
+- **Jittered query:** a peer needing a catalog schedules its `OTA_QUERY` after a random delay
+  `OTA_QUERY_MIN_MS (300) + rand(OTA_QUERY_SPREAD_MS (4000))`, derived from `id ⊕ digest ⊕ self`.
+- **Overhear suppression:** during the jitter window, overhearing *another* QUERY **or** a HAVE for the same
+  `{seeder, set_digest}` CANCELS the pending query.
+
+Net effect: a digest change costs ~1 query + ~1 HAVE flood mesh-wide; a stable mesh is query-free.
+
+### 8.3 Fetch handshake
+
+```
+fetcher                                   server (any node that has the mid)
+  OTA_GET_MANIFEST(mid)        ───────►
+                               ◄───────   OTA_MANIFEST(mid, frag_idx, frag_total, bytes)   × frag_total
+  (reassemble manifest, verify, compute geometry: BC, block_size, payload_size)
+  for each missing block window:
+    OTA_REQ(mid, start_block, count)  ►
+                               ◄───────   OTA_DATA(mid, block_idx, frag_off, data) × (per block)
+    (reassemble block from frag_off slices)
+    OTA_REQ_PROOF(mid, block_idx) ────►
+                               ◄───────   OTA_PROOF(mid, block_idx, n_proof, proof)
+    (verify proof vs merkle_root → write block → write leaves[i])
+  when all blocks present: verify full merkle_root + image_hash → COMPLETE
+```
+
+### 8.4 Message bodies (transfer)
+
+All offsets after the 1-byte type. Encoders/decoders in `OtaProtocol.cpp`; constants in `OtaManager.h`.
+
+```
+OTA_GET_MANIFEST:  manifest_id[4]
+OTA_MANIFEST:      manifest_id[4]  frag_idx(1)  frag_total(1)  bytes[]     # up to OTA_MF_FRAG=176 B/frag
+OTA_REQ:           manifest_id[4]  start_block(uint16)  count(1)
+OTA_DATA:          manifest_id[4]  block_idx(uint16)  frag_off(uint16)  data[]   # up to OTA_FRAG_DATA=160 B
+OTA_REQ_PROOF:     manifest_id[4]  block_idx(uint16)
+OTA_PROOF:         manifest_id[4]  block_idx(uint16)  n_proof(1)  proof[]   # n_proof × 4 bytes
+```
+
+- **Block ⇆ fragments:** a 1 KB block is split into self-describing `OTA_DATA` fragments. `frag_off` is the
+  byte offset of `data` within the block, so the global position is `block_idx*block_size + frag_off` —
+  a fragment is self-placing and may be requested from **any** peer (BitTorrent-style). The fetcher tracks a
+  per-block slice bitmap and reassembles before requesting the proof.
+- **Data and proof are separate phases.** `OTA_DATA` carries no proof; the proof is fetched once per block
+  via `OTA_REQ_PROOF`/`OTA_PROOF` after the block's data is complete.
+
+### 8.5 Sizing against `MAX_PACKET_PAYLOAD = 184`
+
+| message | fixed overhead | payload/packet |
+|---|---|---|
+| `OTA_DATA` | 9 B (type+mid4+idx2+off2) | `OTA_FRAG_DATA = 160` → 7 frags per 1 KB block |
+| `OTA_MANIFEST` | 7 B | `OTA_MF_FRAG = 176` → signed manifest ≈ 2 frags |
+| `OTA_HAVE` | 12 B | 12 rows × 14 B per fragment |
+| `OTA_PROOF` | 8 B | up to ~44 sibling digests (≫ any real tree) |
+
+A served mota supports up to `OTA_MAX_BLOCK/4` leaves in the default 4 KB proof scratch (≤1024 blocks ≈ 1 MB
+payload); larger self-images pass a bigger scratch buffer.
 
 ---
 
 ## 9. Identity, trust & versioning
 
-- **`target_id`** (4 B): compile-time `sha2-256:4(pio_env_name + radio_class + ldscript/partition +
-  platform)`, injected by `build.sh`, read via `MainBoard::getOtaTargetId()`. A node only fetches/serves
-  matching `target_id`. (The PlatformIO env name uniquely captures hardware AND role/partition.)
-- **`fw_version`:** packed comparable uint32 (`MAJOR<<24|MINOR<<16|PATCH<<8|pre`).
-- **Signing & allowlist:** a node keeps a runtime-managed allowlist of trusted Ed25519 signer pubkeys
-  (none embedded in firmware). A `.mota` is eligible for **auto-apply** only if signed by an allowlisted
-  key, the signature verifies, and `image_hash` matches; otherwise it is manual-apply only with explicit
-  confirmation. **Transfer needs no trust** — blocks are content-addressed against the signed root, so
-  any (untrusted) neighbor may relay them.
-
-### 9.1 Supersession & retention
-
-- **Finish-current:** a newer version announced mid-download does not abort the in-progress transfer.
-- **Stale GC:** a staged `.mota` carries a persistent `staged_at` epoch; it is discarded after
-  `ota_stale_ttl` (default **30 days**) unless pinned (`ota keep`) or applying — reclaiming flash from
-  superseded-complete and stalled-partial images alike. `ota discard` frees the slot immediately.
-
----
-
-## 10. Apply & bootloader contract (summary)
-
-- **ESP32:** in-firmware via `Update`/`esp_ota_*` into the inactive A/B slot, then set boot + reboot
-  (power-safe, rollback-capable). No bootloader changes.
-- **nRF52:** running firmware **never** flashes the app. `ota apply` verifies fully, writes the
-  `approval` field (`"APRV"`), then reboots into DFU. The modified bootloader
-  (`Adafruit_nRF52_Bootloader_OTAFIX`) locates the staged `.mota` by scanning for `MAGIC`, re-checks
-  `TRAILER` + signature + `image_hash` + `approval == "APRV"`, applies the codec (delta in-place over
-  the app region), then clears state and boots. The signature proves author authenticity; `approval`
-  proves local owner consent — both required.
+- **`target_id`** (4 B): compile-time `sha2-256:4(pio_env_name)` (little-endian uint32), injected as
+  `-D MOTA_TARGET_ID` by `build.sh` and read via `MainBoard::getOtaTargetId()`; `tools/mota` computes the
+  same from `--target-env`. The PlatformIO env name uniquely captures hardware **and** role/partition, so a
+  node auto-fetches only matching firmware. A manual `ota pull`/`want` can override target (deliberate role
+  switch); the `hw_id` brick-safety gate (§4) still applies at apply time.
+- **`fw_version`:** packed comparable uint32 (`MAJOR<<24 | MINOR<<16 | PATCH<<8 | pre`).
+- **`hw_id`:** 32-byte NUL-padded ASCII hardware tag inside the signed head. The applier refuses a `.mota`
+  whose `hw_id` differs from the device's own tag (empty on either side = permissive). Brick-safety
+  independent of signature.
+- **Signing & allowlist:** a node keeps a runtime allowlist of trusted Ed25519 signer pubkeys (none embedded
+  in firmware; `ota key add/list/rm`). A `.mota` is eligible for **auto-install** only if signed by an
+  allowlisted key, the signature verifies, and `image_hash` matches; otherwise it is manual-apply only with
+  explicit confirmation. **Transfer needs no trust** — blocks are content-addressed against the signed root.
+- **Policies (persisted):** `autofetch` ∈ {off, any, signed} (default off) gates automatic block fetching of
+  own-target adverts; `autoinstall` ∈ {off, trusted} (default off) gates auto-apply of a COMPLETE signed +
+  allowlisted fetch. Conservative defaults: a fresh node discovers + announces but never fetches/installs
+  without operator intent.
+- **Supersession:** a newer version announced mid-download does not abort the in-progress transfer
+  (finish-current).
 
 ---
 
-## 11. Versioning of this spec
+## 10. Multi-mota serve & the external "folder" relay
 
-`format_ver = 1`. Future changes bump `format_ver`; the multihash `hash_algo` allows changing the
-digest family without a format bump. Unknown `format_ver`/`codec_id`/`ota_msg_type` values are ignored
-(forward-compatible).
+A node serves a **set** of mOTAs: its own firmware plus, optionally, an external folder of `.mota` files it
+relays without holding them in flash. To peers it simply "has N mOTAs"; the relay is trustless (fetchers
+verify everything). The serve side (`OtaManager`) keeps a lightweight registry of what it advertises and two
+resident "views": `view0` (its own firmware) and one on-demand view loaded from a source when a request
+targets an external mota. Every fetch message carries `manifest_id`, so dispatch is a registry lookup.
+
+### 10.1 The `MotaSource` abstraction (`OtaSource.h`)
+
+Transport-agnostic provider of one or more complete `.mota` as random-access bytes. The same serve code
+drives USB-serial, BLE, a WiFi URL list, an NFS/samba mount, etc. — only `read()` differs.
+
+```cpp
+struct MotaDesc {                      // catalog metadata + region offsets (no whole image in RAM)
+  uint8_t mid[4]; uint32_t target_id, fw_version; uint8_t codec_id, flags;
+  uint32_t total_size, leaves_off, block_count, payload_off, payload_size;
+};
+class MotaSource {
+  virtual uint8_t count();                                  // # mOTAs offered
+  virtual bool    describe(uint8_t idx, MotaDesc& out);     // metadata + offsets
+  virtual bool    read(uint8_t idx, uint32_t off, uint8_t* buf, uint32_t len);   // random-access bytes
+};
+```
+
+To serve an external mota the node reads its manifest-minus-leaves + `leaves[]` into RAM (≤4 KB for ≤1024
+blocks) and streams payload blocks from the source on demand; proofs are generated from the read leaves.
+
+### 10.2 The `mota-seeder` transport (`MotaSeederProto.h`)
+
+The first concrete `MotaSource` is a host daemon (`tools/mota/mota_seeder.py`) serving a folder over the
+device's **USB serial — the same console the CLI uses** (no extra hardware). The device only emits request
+frames *while actively serving a fetch*, and reads the reply synchronously, so binary frames coexist with
+the text CLI/logs (resync on magic + checksum). Little-endian, XOR-checksummed:
+
+```
+request  (device → host):  'M' 'S'  op(1)  args...                 xsum(1 = XOR of op+args)
+response (host → device):  'm' 's'  op(1)  status(1)  payload...    xsum(1 = XOR of all prior)
+
+OP_COUNT     0x01   args: -            → payload: count(1)
+OP_DESCRIBE  0x02   args: idx(1)       → payload: MotaDesc wire (38 B)
+OP_READ      0x03   args: idx(1) off(4) len(2)  → payload: len bytes
+MotaDesc wire (38 B): mid[4] target_id(4) fw_version(4) codec(1) flags(1)
+                      total_size(4) leaves_off(4) block_count(4) payload_off(4) payload_size(4)
+status: 0 = OK, non-zero = error (out of range / past EOF).
+```
+
+Device CLI: `ota folder on` (attach + announce), `ota folder` (list), `ota folder off`. Build flag
+`OTA_FOLDER_SERIAL` (default stream = console `Serial`; override `OTA_FOLDER_SERIAL_STREAM` + define
+`OTA_FOLDER_SERIAL_BEGIN` for a dedicated UART). Verified on hardware: a RAK4631 relays a host folder to a
+Heltec V3 over one USB cable, every block merkle-checked.
+
+---
+
+## 11. CLI surface (`OtaCli.cpp`)
+
+User-facing OTA data should travel via `CMD_OTA_*` companion binary frames; the text CLI below is
+debug/operator oriented and replies are `snprintf`-bounded into a 160-byte buffer.
+
+```
+ota status                         session + self-fw summary
+ota neighbors                      discovered mOTAs (queries sources; rows arrive async via OTA_HAVE)
+ota announce                       serve self + send a beacon now
+ota pull <#|mid8>                  fetch a chosen mOTA (manual; works regardless of autofetch)
+ota drop                           drop the current fetch session (free the slot)
+ota folder on|off                  attach/detach an external .mota folder (host daemon) ; bare = list
+ota self                           print this firmware's EndF (body/image size, base_hash)
+ota applydelta                     verify + approve + (ESP32) apply / (nRF52) reboot-to-bootloader
+ota config [autofetch|autoinstall|checkpoint] ...    show/set persisted policy
+ota key add|list|rm <hex>          trusted signer allowlist
+ota dev ...                        bring-up helpers (stage/recv/serve/verify)
+```
+
+---
+
+## 12. Apply & bootloader contract
+
+- **ESP32 (A/B):** applied in-firmware via the detools decoder into the inactive OTA slot
+  (`OtaApply.cpp::ota_apply_detools_mota` + `OtaStoreFlashEsp32`), then set-boot + reboot (power-safe,
+  rollback-capable). No bootloader changes. Erase ranges must be sector-aligned (4096).
+- **nRF52 (single-slot):** the running firmware **never** flashes the app. `ota applydelta` verifies fully
+  (`image_hash`, `base_hash`, signature/allowlist, `hw_id`), writes `approval = "APRV"`, then reboots into
+  the modified bootloader (`Adafruit_nRF52_Bootloader_OTAFIX`). The bootloader:
+  1. **scans flash for `MAGIC`** to find the staged `.mota` (it must NOT trust any stored size),
+  2. re-checks `TRAILER`, `image_hash`, `approval == "APRV"`, and that the delta's `base_hash` equals the
+     running firmware's `EndF.body_hash` (recomputed by scanning for `EndF` — never trust `bank_0_size`),
+  3. applies the in-place codec over the app region and boots only if the result hashes to `image_hash`.
+
+The signature proves author authenticity; `approval` proves local owner consent — both required to apply.
+
+> **Bootloader testing note:** always test apply with a *real different* image (base ≠ target). A same-image
+> (X→X) "delta" trivially reproduces the target and gives a false positive.
+
+---
+
+## 13. Versioning of this spec
+
+`format_ver = 2` (v2 added `hw_id` to the signed head and split discovery/transfer as in §8/§10). Future
+changes bump `format_ver`; the multihash `hash_algo` allows changing the digest family without a format
+bump. Unknown `format_ver` / `codec_id` / `ota_msg_type` values are ignored (forward-compatible).

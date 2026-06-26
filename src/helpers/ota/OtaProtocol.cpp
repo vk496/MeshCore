@@ -25,16 +25,41 @@ struct R {
 };
 } // namespace
 
-uint16_t encode_adv(uint8_t* buf, uint16_t cap, const AdvMsg& m) {
-  W w(buf, cap); w.u8(OTA_ADV); w.u32(m.target_id); w.u32(m.fw_version);
-  w.raw(m.manifest_id, 4); w.u8(m.flags); w.u8(m.have_all); w.u8(m.codec_id);
+uint16_t encode_adv(uint8_t* buf, uint16_t cap, const AdvMsg& m) {   // tiny per-node beacon
+  W w(buf, cap); w.u8(OTA_ADV); w.raw(m.seeder_id, 4); w.u8(m.n_motas); w.raw(m.set_digest, 4);
   return w.ok ? w.n : 0;
 }
 bool decode_adv(const uint8_t* buf, uint16_t len, AdvMsg& m) {
   R r(buf, len); if (r.u8() != OTA_ADV) return false;
-  m.target_id = r.u32(); m.fw_version = r.u32();
-  const uint8_t* id = r.raw(4); if (id) memcpy(m.manifest_id, id, 4);
-  m.flags = r.u8(); m.have_all = r.u8(); m.codec_id = r.u8();
+  const uint8_t* sid = r.raw(4); if (sid) memcpy(m.seeder_id, sid, 4);
+  m.n_motas = r.u8();
+  const uint8_t* d = r.raw(4); if (d) memcpy(m.set_digest, d, 4);
+  return r.ok;
+}
+
+uint16_t encode_query(uint8_t* buf, uint16_t cap, const QueryMsg& m) {
+  W w(buf, cap); w.u8(OTA_QUERY); w.raw(m.seeder_id, 4); w.raw(m.set_digest, 4); w.u32(m.filter_target);
+  return w.ok ? w.n : 0;
+}
+bool decode_query(const uint8_t* buf, uint16_t len, QueryMsg& m) {
+  R r(buf, len); if (r.u8() != OTA_QUERY) return false;
+  const uint8_t* sid = r.raw(4); if (sid) memcpy(m.seeder_id, sid, 4);
+  const uint8_t* dg = r.raw(4); if (dg) memcpy(m.set_digest, dg, 4);
+  m.filter_target = r.u32();
+  return r.ok;
+}
+
+uint16_t encode_have(uint8_t* buf, uint16_t cap, const HaveMsg& m) {
+  W w(buf, cap); w.u8(OTA_HAVE); w.raw(m.seeder_id, 4); w.raw(m.set_digest, 4);
+  w.u8(m.frag_idx); w.u8(m.frag_total); w.u8(m.n_rows); w.raw(m.rows, (uint16_t)m.n_rows * OTA_HAVE_ROW_BYTES);
+  return w.ok ? w.n : 0;
+}
+bool decode_have(const uint8_t* buf, uint16_t len, HaveMsg& m) {
+  R r(buf, len); if (r.u8() != OTA_HAVE) return false;
+  const uint8_t* sid = r.raw(4); if (sid) memcpy(m.seeder_id, sid, 4);
+  const uint8_t* dg = r.raw(4); if (dg) memcpy(m.set_digest, dg, 4);
+  m.frag_idx = r.u8(); m.frag_total = r.u8(); m.n_rows = r.u8();
+  m.rows = r.raw((uint16_t)m.n_rows * OTA_HAVE_ROW_BYTES);
   return r.ok;
 }
 
@@ -73,19 +98,38 @@ bool decode_req(const uint8_t* buf, uint16_t len, ReqMsg& m) {
 }
 
 uint16_t encode_data(uint8_t* buf, uint16_t cap, const DataMsg& m) {
-  W w(buf, cap); w.u8(OTA_DATA); w.raw(m.manifest_id, 4); w.u16(m.block_idx);
-  w.u8(m.frag_idx); w.u8(m.frag_total);
-  if (m.frag_idx == 0) { w.u8(m.n_proof); w.raw(m.proof, (uint16_t)m.n_proof * 4); }
+  W w(buf, cap); w.u8(OTA_DATA); w.raw(m.manifest_id, 4); w.u16(m.block_idx); w.u16(m.frag_off);
   w.raw(m.data, m.data_len);
   return w.ok ? w.n : 0;
 }
 bool decode_data(const uint8_t* buf, uint16_t len, DataMsg& m) {
   R r(buf, len); if (r.u8() != OTA_DATA) return false;
   const uint8_t* id = r.raw(4); if (id) memcpy(m.manifest_id, id, 4);
-  m.block_idx = r.u16(); m.frag_idx = r.u8(); m.frag_total = r.u8();
-  m.n_proof = 0; m.proof = nullptr;
-  if (m.frag_idx == 0) { m.n_proof = r.u8(); m.proof = r.raw((uint16_t)m.n_proof * 4); }
+  m.block_idx = r.u16(); m.frag_off = r.u16();
   m.data_len = r.remaining(); m.data = r.raw(m.data_len);
+  return r.ok;
+}
+
+uint16_t encode_req_proof(uint8_t* buf, uint16_t cap, const ReqProofMsg& m) {
+  W w(buf, cap); w.u8(OTA_REQ_PROOF); w.raw(m.manifest_id, 4); w.u16(m.block_idx);
+  return w.ok ? w.n : 0;
+}
+bool decode_req_proof(const uint8_t* buf, uint16_t len, ReqProofMsg& m) {
+  R r(buf, len); if (r.u8() != OTA_REQ_PROOF) return false;
+  const uint8_t* id = r.raw(4); if (id) memcpy(m.manifest_id, id, 4);
+  m.block_idx = r.u16();
+  return r.ok;
+}
+
+uint16_t encode_proof(uint8_t* buf, uint16_t cap, const ProofMsg& m) {
+  W w(buf, cap); w.u8(OTA_PROOF); w.raw(m.manifest_id, 4); w.u16(m.block_idx);
+  w.u8(m.n_proof); w.raw(m.proof, (uint16_t)m.n_proof * 4);
+  return w.ok ? w.n : 0;
+}
+bool decode_proof(const uint8_t* buf, uint16_t len, ProofMsg& m) {
+  R r(buf, len); if (r.u8() != OTA_PROOF) return false;
+  const uint8_t* id = r.raw(4); if (id) memcpy(m.manifest_id, id, 4);
+  m.block_idx = r.u16(); m.n_proof = r.u8(); m.proof = r.raw((uint16_t)m.n_proof * 4);
   return r.ok;
 }
 

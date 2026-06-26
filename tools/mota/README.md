@@ -1,9 +1,8 @@
 # `mota` — MeshCore OTA packaging tool
 
 Host-side tooling for building and validating `.mota` firmware-update containers.
-Implements the wire spec in [`docs/ota_protocol.md`](../../docs/ota_protocol.md) (v1).
-
-Part of the OTA-over-LoRa work — see `OTA_PLAN.md` (milestone **P0**).
+Implements the wire spec in [`docs/ota_protocol.md`](../../docs/ota_protocol.md) — the single source of
+truth for the `.mota` format and the OTA-over-LoRa protocol.
 
 ## Setup
 
@@ -63,6 +62,42 @@ $PY tools/mota/mota.py verify  fw_v1.16.0_delta.mota --pub signer.priv.pub --bas
 ./meshcore/bin/python tools/mota/test_mota.py      # 11 tests: EndF, merkle+proofs, full/delta,
                                                    # signing, tamper detection, approval enforcement
 ```
+
+## Folder serve (`mota_seeder.py`) — relay many `.mota` from a host
+
+A node can advertise + serve `.mota` it does **not** hold in flash, by relaying them from a folder on a
+host computer. Drop several `.mota` (any architecture) into a folder; the node then shows up to peers as
+having all of them. The relay is **trustless** — fetchers verify the merkle root + signature, so the
+host/daemon never needs the signing keys and a bad file simply fails the fetch.
+
+```bash
+# just connect the MeshCore node to the PC over its normal USB — no extra hardware:
+pip install pyserial
+./tools/mota/mota_seeder.py --port /dev/ttyACM0 --baud 115200 --dir ./my_firmware/ -v
+```
+
+The daemon owns the port, auto-sends `ota folder on` to the node, then answers the node's byte requests.
+It speaks a tiny binary request/response protocol (`src/helpers/ota/MotaSeederProto.h`) over the **same
+USB serial the CLI uses** — the node only emits request frames *while actively serving a fetch* and reads
+the reply synchronously, so the binary frames coexist with the text CLI / logs (the daemon resyncs on a
+magic + checksum and surfaces device text as `[dev]` lines). Peers discover the folder mOTAs via the
+normal beacon → query → HAVE catalog and `ota pull <mid>` fetches them block-by-block straight from the
+host folder. Verified on HW: a RAK4631 relayed a host folder to a Heltec V3, which fetched a folder mota
+to COMPLETE (every block merkle-checked) over the single USB.
+
+`OTA_FOLDER_SERIAL` is already enabled on the stock RAK4631 / ESP32 OTA repeater builds (inert until you
+run `ota folder on` — which the daemon does for you). To point the relay at a *dedicated* UART instead of
+the console, override in `platformio.ini`:
+
+```ini
+build_flags =
+  -D OTA_FOLDER_SERIAL_STREAM=Serial1        ; default is the USB console `Serial`
+  -D OTA_FOLDER_SERIAL_BEGIN                  ; call .begin() on it (console is already initialized)
+  -D OTA_FOLDER_SERIAL_BAUD=115200
+```
+
+CLI on the node: `ota folder on` (attach + announce), `ota folder` (list served mOTAs, `*`=own fw),
+`ota folder off` (detach).
 
 ## `EndF` build integration
 

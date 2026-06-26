@@ -100,12 +100,14 @@ def cmd_build(args):
         is_full=is_full,
         base_hash=base_hash,
         sign_priv=sign_priv,
+        hw_id=args.hw_id,
     )
     blob = ml.build_container(manifest, payload)
     Path(args.out).write_bytes(blob)
 
     print(f"wrote {args.out}  ({len(blob)} bytes)")
     print(f"  codec        : {ml.CODEC_NAMES[codec_id]}")
+    print(f"  hw_id        : {manifest.hw_id.rstrip(bytes([0])).decode('ascii', 'replace') or '(none)'}")
     print(f"  payload      : {len(payload)} bytes  ({manifest.block_count} blocks of {args.block_size})")
     print(f"  image_size   : {image_size} bytes  (BODY+EndF)")
     print(f"  merkle_root  : {manifest.merkle_root.hex()}")
@@ -201,6 +203,8 @@ def main(argv=None):
                    help="delta patch compression (decode-cheap 'crle' default; must be supported by "
                         "the applier. Ignored for --codec full, whose payload is the raw flashable image)")
     b.add_argument("--block-size", type=int, default=ml.DEFAULT_BLOCK_SIZE)
+    b.add_argument("--hw-id", default="", help="hardware tag (<=32 ASCII chars, e.g. RAK4631) the firmware "
+                   "can boot on; the device refuses a .mota whose hw_id differs from its own. Empty = unset.")
     b.add_argument("--sign", help="Ed25519 private key file (hex) to sign the manifest")
     b.add_argument("--inplace-memory", type=int, default=4096, help="detools in-place memory_size")
     b.add_argument("--inplace-segment", type=int, default=4096, help="detools in-place segment_size")

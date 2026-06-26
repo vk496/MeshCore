@@ -28,7 +28,7 @@ bool mota_parse(const uint8_t* buf, uint32_t len, MotaManifest& out) {
   // helper bounds check
   #define NEED(n) do { if ((uint32_t)(end - p) < (uint32_t)(n)) return false; } while (0)
 
-  NEED(3 + 16 + 1 + 4 + 32 + 1);
+  NEED(3 + 16 + 1 + 4 + 32 + 1 + 32);          // fixed head incl. hw_id[32]
   out.format_ver = p[0];
   if (out.format_ver != MOTA_FORMAT_VER) return false;
   out.flags = p[1];
@@ -41,7 +41,8 @@ bool mota_parse(const uint8_t* buf, uint32_t len, MotaManifest& out) {
   out.merkle_root = p + 20;
   out.image_hash  = p + 24;
   out.codec_id    = p[56];
-  p += 57;
+  out.hw_id       = p + 57;                     // 32-byte NUL-padded hardware tag (signed)
+  p += 89;
 
   if (out.block_size_log2 == 0 || out.block_size_log2 > 24) return false;
   uint32_t bs = out.block_size();
@@ -77,7 +78,7 @@ bool mota_parse_manifest(const uint8_t* mf, uint32_t len, MotaManifest& out) {
   const uint8_t* end = mf + len;
   #define NEEDM(n) do { if ((uint32_t)(end - p) < (uint32_t)(n)) return false; } while (0)
 
-  NEEDM(57);
+  NEEDM(89);                                   // fixed head incl. hw_id[32]
   out.manifest_start = mf;
   out.format_ver = p[0];
   if (out.format_ver != MOTA_FORMAT_VER) return false;
@@ -91,7 +92,8 @@ bool mota_parse_manifest(const uint8_t* mf, uint32_t len, MotaManifest& out) {
   out.merkle_root = p + 20;
   out.image_hash  = p + 24;
   out.codec_id    = p[56];
-  p += 57;
+  out.hw_id       = p + 57;                     // 32-byte NUL-padded hardware tag (signed)
+  p += 89;
   if (!out.is_full()) { NEEDM(8); out.base_hash = p; p += 8; }
   if (out.is_signed()) {
     NEEDM(32); out.signer_pubkey = p; p += 32;

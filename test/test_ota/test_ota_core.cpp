@@ -48,6 +48,8 @@ TEST(OtaParse, ParsesReferenceContainer) {
   EXPECT_EQ(m.codec_id, EXP_CODEC_ID);
   EXPECT_EQ(0, memcmp(m.merkle_root, EXP_MERKLE_ROOT, 4));
   EXPECT_EQ(0, memcmp(m.image_hash, EXP_IMAGE_HASH, 32));
+  ASSERT_NE(m.hw_id, nullptr);
+  EXPECT_EQ(0, memcmp(m.hw_id, EXP_HW_ID, 32));        // v2 hardware tag ("TESTHW" NUL-padded)
   EXPECT_EQ(0, memcmp(m.approval, APPROVAL_NOT, 4));   // distributed = not approved
   EXPECT_FALSE(m.is_approved());
 }
@@ -304,14 +306,35 @@ TEST(OtaMerkle, GenProofMatchesPythonAndVerifies) {
 TEST(OtaProtocol, CodecRoundTrips) {
   uint8_t buf[200];
 
-  AdvMsg adv{0x11223344, 0x02000000, {0x29,0x17,0xe4,0xf7}, MFLAG_FULL | MFLAG_SIGNED, 1, CODEC_DETOOLS_INPLACE};
+  // OTA_ADV is now a tiny per-node beacon: seeder_id + n_motas + set_digest
+  AdvMsg adv{{0x29,0x17,0xe4,0xf7}, 7, {0xde,0xad,0xbe,0xef}};
   uint16_t n = encode_adv(buf, sizeof(buf), adv);
-  ASSERT_GT(n, 0); EXPECT_EQ(ota_msg_type(buf, n), OTA_ADV);
+  ASSERT_GT(n, 0); EXPECT_EQ(ota_msg_type(buf, n), OTA_ADV); EXPECT_EQ(n, 10);
   AdvMsg a2; ASSERT_TRUE(decode_adv(buf, n, a2));
-  EXPECT_EQ(a2.target_id, adv.target_id); EXPECT_EQ(a2.fw_version, adv.fw_version);
-  EXPECT_EQ(0, memcmp(a2.manifest_id, adv.manifest_id, 4));
-  EXPECT_EQ(a2.flags, adv.flags); EXPECT_EQ(a2.have_all, 1);
-  EXPECT_EQ(a2.codec_id, CODEC_DETOOLS_INPLACE);
+  EXPECT_EQ(0, memcmp(a2.seeder_id, adv.seeder_id, 4));
+  EXPECT_EQ(a2.n_motas, 7);
+  EXPECT_EQ(0, memcmp(a2.set_digest, adv.set_digest, 4));
+
+  // OTA_QUERY: ask a source (by seeder_id) for the offering set_digest, optionally filtered to a target
+  QueryMsg qy{{0x29,0x17,0xe4,0xf7}, {0xd1,0xd2,0xd3,0xd4}, 0x11223344};
+  n = encode_query(buf, sizeof(buf), qy);
+  ASSERT_GT(n, 0); EXPECT_EQ(ota_msg_type(buf, n), OTA_QUERY);
+  QueryMsg q2; ASSERT_TRUE(decode_query(buf, n, q2));
+  EXPECT_EQ(0, memcmp(q2.seeder_id, qy.seeder_id, 4));
+  EXPECT_EQ(0, memcmp(q2.set_digest, qy.set_digest, 4));
+  EXPECT_EQ(q2.filter_target, 0x11223344u);
+
+  // OTA_HAVE: a 2-row catalog (mid, target, fwver, codec, flags per row) tagged with the offering digest
+  uint8_t rows[2 * 14];
+  for (int i = 0; i < 2 * 14; i++) rows[i] = (uint8_t)(i + 1);
+  HaveMsg hv{{0x29,0x17,0xe4,0xf7}, {0xd1,0xd2,0xd3,0xd4}, 0, 1, 2, rows};
+  n = encode_have(buf, sizeof(buf), hv);
+  ASSERT_GT(n, 0); EXPECT_EQ(ota_msg_type(buf, n), OTA_HAVE);
+  HaveMsg h2; ASSERT_TRUE(decode_have(buf, n, h2));
+  EXPECT_EQ(0, memcmp(h2.seeder_id, hv.seeder_id, 4));
+  EXPECT_EQ(0, memcmp(h2.set_digest, hv.set_digest, 4));
+  EXPECT_EQ(h2.frag_total, 1); EXPECT_EQ(h2.n_rows, 2);
+  EXPECT_EQ(0, memcmp(h2.rows, rows, 2 * 14));
 
   GetManifestMsg gm{{1,2,3,4}};
   n = encode_get_manifest(buf, sizeof(buf), gm);
@@ -330,20 +353,36 @@ TEST(OtaProtocol, CodecRoundTrips) {
   ReqMsg r2; ASSERT_TRUE(decode_req(buf, n, r2));
   EXPECT_EQ(r2.start_block, 7); EXPECT_EQ(r2.count, 5);
 
-  uint8_t proof[12]; for (int i = 0; i < 12; i++) proof[i] = (uint8_t)(0xA0 + i);
+  // DATA is one self-describing fragment of a block (frag_off places it; proof is fetched separately)
   uint8_t data[100]; for (int i = 0; i < 100; i++) data[i] = (uint8_t)(i * 3);
-  DataMsg dm{{0,1,2,3}, 42, 0, 1, 3, proof, data, 100};
+  DataMsg dm{{0,1,2,3}, 42, 0, data, 100};                  // block 42, fragment at offset 0
   n = encode_data(buf, sizeof(buf), dm);
   DataMsg d2; ASSERT_TRUE(decode_data(buf, n, d2));
-  EXPECT_EQ(d2.block_idx, 42); EXPECT_EQ(d2.frag_idx, 0); EXPECT_EQ(d2.n_proof, 3);
-  EXPECT_EQ(0, memcmp(d2.proof, proof, 12));
+  EXPECT_EQ(d2.block_idx, 42); EXPECT_EQ(d2.frag_off, 0);
   EXPECT_EQ(d2.data_len, 100); EXPECT_EQ(0, memcmp(d2.data, data, 100));
 
-  // a non-frag0 DATA carries no proof
-  DataMsg dm2{{0,1,2,3}, 42, 2, 6, 0, nullptr, data, 50};
+  // a later slice of the same block (non-zero frag_off)
+  DataMsg dm2{{0,1,2,3}, 42, 160, data, 50};
   n = encode_data(buf, sizeof(buf), dm2);
   DataMsg d3; ASSERT_TRUE(decode_data(buf, n, d3));
-  EXPECT_EQ(d3.frag_idx, 2); EXPECT_EQ(d3.n_proof, 0); EXPECT_EQ(d3.data_len, 50);
+  EXPECT_EQ(d3.block_idx, 42); EXPECT_EQ(d3.frag_off, 160); EXPECT_EQ(d3.data_len, 50);
+
+  // REQ_PROOF: request the merkle proof for one (reassembled) block
+  ReqProofMsg rp{{7,7,8,8}, 13};
+  n = encode_req_proof(buf, sizeof(buf), rp);
+  ASSERT_GT(n, 0); EXPECT_EQ(ota_msg_type(buf, n), OTA_REQ_PROOF);
+  ReqProofMsg rp2; ASSERT_TRUE(decode_req_proof(buf, n, rp2));
+  EXPECT_EQ(0, memcmp(rp2.manifest_id, rp.manifest_id, 4)); EXPECT_EQ(rp2.block_idx, 13);
+
+  // PROOF: ordered sibling digests for one block
+  uint8_t proof[12]; for (int i = 0; i < 12; i++) proof[i] = (uint8_t)(0xA0 + i);
+  ProofMsg pm{{7,7,8,8}, 13, 3, proof};
+  n = encode_proof(buf, sizeof(buf), pm);
+  ASSERT_GT(n, 0); EXPECT_EQ(ota_msg_type(buf, n), OTA_PROOF);
+  ProofMsg pm2; ASSERT_TRUE(decode_proof(buf, n, pm2));
+  EXPECT_EQ(0, memcmp(pm2.manifest_id, pm.manifest_id, 4));
+  EXPECT_EQ(pm2.block_idx, 13); EXPECT_EQ(pm2.n_proof, 3);
+  EXPECT_EQ(0, memcmp(pm2.proof, proof, 12));
 }
 
 // --- full transfer simulation between two OtaManagers (P4b) ------------------------------------
@@ -355,6 +394,54 @@ struct SendTo { OtaManager* dest; };
 static void sim_send(void* ctx, const uint8_t* msg, uint16_t len, bool /*flood*/) {
   g_q.push_back({((SendTo*)ctx)->dest, std::vector<uint8_t>(msg, msg + len)});
 }
+// Drive the bus to quiescence: deliver queued messages; when idle, advance the client's clock (monotonic
+// across calls, so a jittered query scheduled in a prior pump still comes due) and call loop() (fires the
+// scheduled catalog query / block re-requests). Two idle ticks in a row = quiescent.
+static uint32_t g_clk = 0;
+static void pump(OtaManager& client, int guard_max = 200000) {
+  int idle = 0, guard = 0;
+  while (guard++ < guard_max) {
+    if (!g_q.empty()) {
+      SimMsg m = std::move(g_q.front()); g_q.erase(g_q.begin());
+      m.dest->on_message(m.bytes.data(), (uint16_t)m.bytes.size());
+      idle = 0;
+    } else {
+      g_clk += 5000; client.set_clock(g_clk); client.loop();
+      if (!g_q.empty()) { idle = 0; continue; }
+      if (++idle >= 2) break;
+    }
+  }
+}
+
+// A test MotaSource backing an external "folder" with one or more complete `.mota` images held in RAM —
+// the simplest concrete transport (a real device uses serial/BLE/WiFi/FS, same interface). describe()
+// parses each container for the catalog + region offsets; read() is a bounds-checked memcpy.
+class RamMotaSource : public mesh::ota::MotaSource {
+public:
+  void add(const uint8_t* buf, uint32_t len) { if (_n < 8) { _buf[_n] = buf; _len[_n] = len; _n++; } }
+  uint8_t count() override { return _n; }
+  bool describe(uint8_t idx, mesh::ota::MotaDesc& d) override {
+    if (idx >= _n) return false;
+    MotaManifest m;
+    if (!mota_parse(_buf[idx], _len[idx], m)) return false;
+    std::memcpy(d.mid, m.merkle_root, 4);
+    d.target_id = m.target_id; d.fw_version = m.fw_version;
+    d.codec_id = m.codec_id; d.flags = m.flags;
+    d.total_size = _len[idx];
+    d.leaves_off = (uint32_t)(m.leaves - _buf[idx]);
+    d.block_count = m.block_count;
+    d.payload_off = (uint32_t)(m.payload - _buf[idx]);
+    d.payload_size = m.payload_size;
+    return true;
+  }
+  bool read(uint8_t idx, uint32_t off, uint8_t* out, uint32_t len) override {
+    if (idx >= _n || (uint64_t)off + len > _len[idx]) return false;
+    std::memcpy(out, _buf[idx] + off, len);
+    return true;
+  }
+private:
+  const uint8_t* _buf[8] = {nullptr}; uint32_t _len[8] = {0}; uint8_t _n = 0;
+};
 }
 
 TEST(OtaTransfer, TwoManagersFullTransfer) {
@@ -366,18 +453,12 @@ TEST(OtaTransfer, TwoManagersFullTransfer) {
   server.begin(/*server's own target irrelevant for serving*/ 0, sim_send, &to_client);
   client.begin(SIM_TARGET_ID, sim_send, &to_server);
   client.set_fetch_store(&store);
+  client.set_autofetch(OtaManager::AUTOFETCH_ANY);   // tests exercise fetch-on-advert; policy default is OFF
 
   ASSERT_TRUE(server.serve(SIM_MOTA, SIM_MOTA_LEN));
-  server.announce();   // -> client hears the ADV and starts fetching
+  server.announce();   // -> client hears the beacon, queries, catalogs, then fetches
 
-  // drain the message bus until the client completes (event cascade does the whole transfer)
-  int guard = 0;
-  while (!g_q.empty() && guard++ < 100000) {
-    SimMsg m = std::move(g_q.front());
-    g_q.erase(g_q.begin());
-    m.dest->on_message(m.bytes.data(), (uint16_t)m.bytes.size());
-    if (g_q.empty() && client.fetchState() == OtaManager::FETCHING) client.loop();
-  }
+  pump(client);        // beacon -> query -> have -> startFetch -> full transfer
 
   EXPECT_EQ(client.fetchState(), OtaManager::COMPLETE);
   EXPECT_EQ(client.blocksHave(), client.blocksTotal());
@@ -394,6 +475,138 @@ TEST(OtaTransfer, TwoManagersFullTransfer) {
   EXPECT_TRUE(mota_check_image_hash_full(m));
 }
 
+// Same end-to-end transfer, but with 1 KB logical blocks: each block is delivered as several
+// self-describing DATA fragments (frag_off), reassembled by the client, then its merkle PROOF is
+// requested + verified separately before the block is committed. Exercises the multi-fragment path.
+TEST(OtaTransfer, MultiFragmentBlocks) {
+  g_q.clear();
+  OtaManager server, client;
+  OtaStoreRam<4096> store;
+  SendTo to_client{&client}, to_server{&server};
+
+  server.begin(0, sim_send, &to_client);
+  client.begin(SIM_TARGET_ID, sim_send, &to_server);
+  client.set_fetch_store(&store);
+  client.set_autofetch(OtaManager::AUTOFETCH_ANY);
+
+  ASSERT_TRUE(server.serve(SIM_MOTA_1K, SIM_MOTA_1K_LEN));
+  server.announce();
+
+  pump(client);
+
+  EXPECT_EQ(client.fetchState(), OtaManager::COMPLETE);
+  EXPECT_EQ(client.blocksTotal(), SIM_MOTA_1K_BLOCKS);   // 1 KB blocks => fewer, larger blocks
+  EXPECT_EQ(client.blocksHave(), client.blocksTotal());
+
+  ASSERT_EQ(store.staged_size(), SIM_MOTA_1K_LEN);
+  EXPECT_EQ(0, std::memcmp(store.data(), SIM_MOTA_1K, SIM_MOTA_1K_LEN));
+  MotaManifest m;
+  ASSERT_TRUE(mota_parse(store.data(), store.staged_size(), m));
+  EXPECT_TRUE(mota_check_root(m));
+  EXPECT_TRUE(mota_check_image_hash_full(m));
+}
+
+// Multi-mota folder serve: a node serves its OWN fw (view0) PLUS an external folder (RamMotaSource) of
+// other `.mota`. Peers discover BOTH via the tiny beacon -> query -> broadcast HAVE catalog, then fetch an
+// external mota end-to-end. The relaying node never holds the folder image in RAM — it streams the
+// manifest/leaves/blocks from the source on demand (loadSource + srcReadTramp + proof-gen from read
+// leaves). The fetched bytes must equal the original `.mota` (proves the trustless relay is byte-exact).
+TEST(OtaFolder, ServesSelfPlusFolderAndFetchesExternal) {
+  g_q.clear();
+  OtaManager server, client;
+  OtaStoreRam<4096> store;
+  SendTo to_client{&client}, to_server{&server};
+
+  server.begin(/*own target irrelevant for serving*/ 0, sim_send, &to_client);
+  uint8_t srv_id[4] = {0xAB, 0xCD, 0xEF, 0x01}; server.set_seeder_id(srv_id);
+  client.begin(SIM_TARGET_ID, sim_send, &to_server);
+  client.set_fetch_store(&store);
+
+  MotaManifest mSelf, mExt;
+  ASSERT_TRUE(mota_parse(SIM_MOTA,    SIM_MOTA_LEN,    mSelf));   // served as our own fw (view0)
+  ASSERT_TRUE(mota_parse(SIM_MOTA_1K, SIM_MOTA_1K_LEN, mExt));    // served from the external folder
+
+  ASSERT_TRUE(server.serve(SIM_MOTA, SIM_MOTA_LEN));             // entry 0 = self
+  static RamMotaSource folder;
+  folder.add(SIM_MOTA_1K, SIM_MOTA_1K_LEN);                      // an external image (different mid)
+  folder.add(SIM_MOTA, SIM_MOTA_LEN);                            // same as self -> must be DEDUPED
+  ASSERT_TRUE(server.add_source(&folder));
+  EXPECT_EQ(server.servedCount(), 2);                           // self + 1 distinct folder mota (dedup)
+
+  // discovery: beacon -> the client catalogs the source, queries it, and the broadcast HAVE fills the
+  // catalog with BOTH served mids.
+  server.announce();
+  pump(client);
+  client.queryAll();
+  pump(client);
+  EXPECT_EQ(client.catalogCount(), 2);
+
+  // fetch the EXTERNAL (folder) mota by mid -> served via the source, relayed block-by-block.
+  client.pull(mExt.merkle_root, mExt.target_id);
+  pump(client);
+
+  EXPECT_EQ(client.fetchState(), OtaManager::COMPLETE);
+  EXPECT_EQ(client.blocksHave(), client.blocksTotal());
+  ASSERT_EQ(store.staged_size(), SIM_MOTA_1K_LEN);
+  EXPECT_EQ(0, std::memcmp(store.data(), SIM_MOTA_1K, SIM_MOTA_1K_LEN));   // byte-exact relay
+  MotaManifest got;
+  ASSERT_TRUE(mota_parse(store.data(), store.staged_size(), got));
+  EXPECT_TRUE(mota_check_root(got));
+  EXPECT_TRUE(mota_check_image_hash_full(got));
+}
+
+// Fetch-resume across a reboot: a client commits some blocks, "reboots" (a fresh OtaManager on the SAME
+// persisted store), and resumeStaged() re-adopts the partial container and finishes the remaining blocks —
+// without re-fetching the manifest or the blocks already present.
+TEST(OtaTransfer, ResumeAfterReboot) {
+  g_q.clear();
+  OtaManager server, client;
+  OtaStoreRam<4096> store;
+  SendTo to_client{&client}, to_server{&server};
+
+  server.begin(0, sim_send, &to_client);
+  client.begin(SIM_TARGET_ID, sim_send, &to_server);
+  client.set_fetch_store(&store);
+  client.set_autofetch(OtaManager::AUTOFETCH_ANY);
+
+  ASSERT_TRUE(server.serve(SIM_MOTA_1K, SIM_MOTA_1K_LEN));
+  server.announce();
+
+  // drive only until the first block commits, then "crash"
+  int idle = 0, guard = 0;
+  while (guard++ < 100000) {
+    if (!g_q.empty()) {
+      SimMsg msg = std::move(g_q.front()); g_q.erase(g_q.begin());
+      msg.dest->on_message(msg.bytes.data(), (uint16_t)msg.bytes.size());
+      idle = 0;
+    } else {
+      g_clk += 5000; client.set_clock(g_clk); client.loop();
+      if (!g_q.empty()) { idle = 0; } else if (++idle >= 2) break;
+    }
+    if (client.blocksHave() >= 1) break;
+  }
+  ASSERT_GE(client.blocksHave(), 1u);
+  ASSERT_LT(client.blocksHave(), client.blocksTotal());     // genuinely partial
+  uint32_t had = client.blocksHave();
+  g_q.clear();                                              // in-flight packets are lost in the "reboot"
+
+  // "reboot": a brand-new manager on the SAME store (its bytes survived) resumes the partial
+  OtaManager client2;
+  to_client.dest = &client2;                                // server now replies to the rebooted client
+  SendTo to_server2{&server};
+  client2.begin(SIM_TARGET_ID, sim_send, &to_server2);
+  client2.set_fetch_store(&store);
+  ASSERT_TRUE(client2.resumeStaged(nullptr));               // adopt whatever is staged
+  EXPECT_EQ(client2.blocksHave(), had);                     // resumed exactly where we left off
+  EXPECT_EQ(client2.fetchState(), OtaManager::FETCHING);
+  EXPECT_EQ(client2.blocksTotal(), SIM_MOTA_1K_BLOCKS);
+
+  pump(client2);
+  EXPECT_EQ(client2.fetchState(), OtaManager::COMPLETE);
+  ASSERT_EQ(store.staged_size(), SIM_MOTA_1K_LEN);
+  EXPECT_EQ(0, std::memcmp(store.data(), SIM_MOTA_1K, SIM_MOTA_1K_LEN));   // byte-identical to the original
+}
+
 TEST(OtaTransfer, ClientRejectsWrongTarget) {
   g_q.clear();
   OtaManager server, client;
@@ -402,13 +615,10 @@ TEST(OtaTransfer, ClientRejectsWrongTarget) {
   server.begin(0, sim_send, &to_client);
   client.begin(SIM_TARGET_ID ^ 0x1u, sim_send, &to_server);   // different target -> not interested
   client.set_fetch_store(&store);
+  client.set_autofetch(OtaManager::AUTOFETCH_ANY);   // tests exercise fetch-on-advert; policy default is OFF
   ASSERT_TRUE(server.serve(SIM_MOTA, SIM_MOTA_LEN));
   server.announce();
-  int guard = 0;
-  while (!g_q.empty() && guard++ < 1000) {
-    SimMsg m = std::move(g_q.front()); g_q.erase(g_q.begin());
-    m.dest->on_message(m.bytes.data(), (uint16_t)m.bytes.size());
-  }
+  pump(client);   // catalogs the row but wantRow rejects it (wrong target) -> never fetches
   EXPECT_EQ(client.fetchState(), OtaManager::IDLE);   // never started
 }
 
@@ -422,46 +632,55 @@ TEST(OtaTransfer, ManualCrossTargetFetch) {
   server.begin(0, sim_send, &to_client);
   client.begin(SIM_TARGET_ID ^ 0xABCDu, sim_send, &to_server);   // DIFFERENT own target
   client.set_fetch_store(&store);
+  client.set_autofetch(OtaManager::AUTOFETCH_ANY);   // tests exercise fetch-on-advert; policy default is OFF
   ASSERT_TRUE(server.serve(SIM_MOTA, SIM_MOTA_LEN));
 
-  // without the override: ignores the ADV (wrong target)
+  // without the override: catalogs the row but won't fetch (wrong target)
   server.announce();
-  for (int g = 0; !g_q.empty() && g < 1000; g++) { SimMsg m = std::move(g_q.front()); g_q.erase(g_q.begin()); m.dest->on_message(m.bytes.data(), (uint16_t)m.bytes.size()); }
+  pump(client);
   EXPECT_EQ(client.fetchState(), OtaManager::IDLE);
 
   // with want(): deliberately fetch the different-target firmware to completion
   client.want(SIM_TARGET_ID);
   server.announce();
-  int guard = 0;
-  while (!g_q.empty() && guard++ < 100000) {
-    SimMsg m = std::move(g_q.front()); g_q.erase(g_q.begin());
-    m.dest->on_message(m.bytes.data(), (uint16_t)m.bytes.size());
-    if (g_q.empty() && client.fetchState() == OtaManager::FETCHING) client.loop();
-  }
+  pump(client);
   EXPECT_EQ(client.fetchState(), OtaManager::COMPLETE);
   ASSERT_EQ(store.staged_size(), SIM_MOTA_LEN);
   EXPECT_EQ(0, std::memcmp(store.data(), SIM_MOTA, SIM_MOTA_LEN));
 }
 
-// A node must not fetch firmware it can't apply: an ADV whose codec the platform can't decode is
-// rejected at ADV time (never requests the manifest). FULL + the platform's delta codec are accepted.
+// Encode a 1-row OTA_HAVE catalog (the discovery reply a peer acts on).
+static uint16_t make_have1(uint8_t* buf, uint16_t cap, const uint8_t mid[4],
+                           uint32_t target, uint32_t fwver, uint8_t codec, uint8_t flags) {
+  uint8_t row[OTA_HAVE_ROW_BYTES];
+  memcpy(row, mid, 4);
+  row[4]=target; row[5]=target>>8; row[6]=target>>16; row[7]=target>>24;
+  row[8]=fwver; row[9]=fwver>>8; row[10]=fwver>>16; row[11]=fwver>>24;
+  row[12]=codec; row[13]=flags;
+  HaveMsg hv{{0xAA,0xBB,0xCC,0xDD}, {0,0,0,0}, 0, 1, 1, row};
+  return encode_have(buf, cap, hv);
+}
+
+// A node must not fetch firmware it can't apply: a catalog row whose codec the platform can't decode is
+// not fetched. FULL + the platform's delta codec(s) are accepted.
 TEST(OtaTransfer, RejectsIncompatibleCodec) {
+  g_q.clear();
   OtaManager client; OtaStoreRam<4096> store;
   SendTo to_server{&client};                       // dest unused (we only check client state)
   client.begin(SIM_TARGET_ID, sim_send, &to_server);
   client.set_fetch_store(&store);
-  client.set_apply_codec(CODEC_DETOOLS_INPLACE);    // nRF52-style: accepts only full + in-place
-  uint8_t b[32];
+  client.set_autofetch(OtaManager::AUTOFETCH_ANY);
+  client.set_apply_codec(CODEC_DETOOLS_INPLACE);   // nRF52-style: accepts only full + in-place
+  uint8_t b[64];
 
-  // our target, but a SEQUENTIAL delta -> incompatible -> ignored (stays IDLE, no GET_MANIFEST)
-  AdvMsg seq{SIM_TARGET_ID, 0x01000000, {1,2,3,4}, 0, 1, CODEC_DETOOLS_SEQUENTIAL};
-  client.on_message(b, encode_adv(b, sizeof(b), seq));
+  // a SEQUENTIAL delta for our target -> incompatible -> not fetched (stays IDLE)
+  uint8_t midA[4] = {1,2,3,4};
+  client.on_message(b, make_have1(b, sizeof(b), midA, SIM_TARGET_ID, 0x01000000, CODEC_DETOOLS_SEQUENTIAL, 0));
   EXPECT_EQ(client.fetchState(), OtaManager::IDLE);
-  EXPECT_TRUE(g_q.empty());
 
-  // our target, IN-PLACE delta -> compatible -> proceeds to request the manifest
-  AdvMsg ip{SIM_TARGET_ID, 0x01000000, {5,6,7,8}, 0, 1, CODEC_DETOOLS_INPLACE};
-  client.on_message(b, encode_adv(b, sizeof(b), ip));
+  // an IN-PLACE delta for our target -> compatible -> begins fetching (requests the manifest)
+  uint8_t midB[4] = {5,6,7,8};
+  client.on_message(b, make_have1(b, sizeof(b), midB, SIM_TARGET_ID, 0x01000000, CODEC_DETOOLS_INPLACE, 0));
   EXPECT_EQ(client.fetchState(), OtaManager::WANT_MANIFEST);
   g_q.clear();
 }
