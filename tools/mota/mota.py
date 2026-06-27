@@ -70,6 +70,17 @@ def cmd_build(args):
     image_hash = ml.mh32(new_image)
     image_size = len(new_image)
 
+    # Self-describing identity: if the firmware carries an extended EndF (target_id/fw_version/hw_id), use
+    # it as the default so a raw .bin from a folder packages correctly WITHOUT --target-env/--fw-version/
+    # --hw-id (we can't rely on filenames). Explicit flags still override.
+    ident = ml.parse_endf_ident(new_image)
+    if args.target_env:   target_id = ml.target_id_for_env(args.target_env)
+    elif args.target_id:  target_id = _parse_target_id(args.target_id)
+    elif ident and ident.target_id: target_id = ident.target_id
+    else: sys.exit("no target: pass --target-env/--target-id, or build a firmware whose EndF carries one")
+    fw_version = ml.pack_version(args.fw_version) if args.fw_version else (ident.fw_version if ident else 0)
+    hw_id = args.hw_id or (ident.hw_id if ident else "")
+
     codec_map = {"full": ml.CODEC_FULL,
                  "sequential": ml.CODEC_DETOOLS_SEQUENTIAL,
                  "inplace": ml.CODEC_DETOOLS_INPLACE}
@@ -85,13 +96,30 @@ def cmd_build(args):
         if not args.base:
             sys.exit("delta codec requires --base <old-firmware.bin>")
         old_image, base_hash = ml.ensure_endf(Path(args.base).read_bytes())
+        # A delta is only applicable to the SAME hardware+role as the target. Verify via the firmwares'
+        # self-describing EndF identity (not the filenames), so we never ship a cross-HW delta that would
+        # brick a node. Skippable with --force for deliberate cross-target experiments.
+        base_ident = ml.parse_endf_ident(old_image)
+        if ident and base_ident:
+            mismatch = []
+            if ident.hw_id and base_ident.hw_id and ident.hw_id != base_ident.hw_id:
+                mismatch.append(f"hw_id {base_ident.hw_id!r} (base) != {ident.hw_id!r} (target)")
+            if ident.target_id and base_ident.target_id and ident.target_id != base_ident.target_id:
+                mismatch.append(f"target_id {base_ident.target_id:#010x} != {ident.target_id:#010x}")
+            if mismatch and not args.force:
+                sys.exit("refusing cross-hardware delta (use --force to override):\n  " + "\n  ".join(mismatch))
+            if mismatch:
+                print("WARNING: building a cross-hardware delta (--force): " + "; ".join(mismatch))
+        elif not args.force:
+            print("note: base and/or target firmware has no EndF identity — cannot verify same-hardware "
+                  "(build a firmware whose EndF carries identity, or pass --force to silence)")
         payload = _make_delta(old_image, new_image, args.codec, args.compression, args)
 
     sign_priv = _load_priv(args.sign) if args.sign else None
 
     manifest = ml.build_manifest(
-        target_id=_resolve_target_id(args),
-        fw_version=ml.pack_version(args.fw_version),
+        target_id=target_id,
+        fw_version=fw_version,
         image_size=image_size,
         payload=payload,
         block_size=args.block_size,
@@ -100,7 +128,7 @@ def cmd_build(args):
         is_full=is_full,
         base_hash=base_hash,
         sign_priv=sign_priv,
-        hw_id=args.hw_id,
+        hw_id=hw_id,
     )
     blob = ml.build_container(manifest, payload)
     Path(args.out).write_bytes(blob)
@@ -195,7 +223,10 @@ def main(argv=None):
     b.add_argument("--target-id", help="target_id (0x.. or decimal)")
     b.add_argument("--target-env", help="PlatformIO env name; target_id = sha2-256:4(env) "
                                         "(matches build.sh / device getOtaTargetId)")
-    b.add_argument("--fw-version", required=True, help="e.g. 1.16.0 (or .pre as 1.16.0.2)")
+    b.add_argument("--fw-version", help="e.g. 1.16.0 (or .pre as 1.16.0.2). Optional: read from the "
+                                        "firmware's EndF identity if present.")
+    b.add_argument("--force", action="store_true",
+                   help="build a delta even if base/target hardware identities differ (normally refused)")
     b.add_argument("--codec", choices=["full", "sequential", "inplace"], default="full")
     b.add_argument("--base", help="base firmware (.bin) for delta codecs")
     b.add_argument("--compression", default="crle",

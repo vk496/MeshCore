@@ -59,9 +59,16 @@ and how recently it was seen. For example:
 
 ```
 Updates nearby (2 src) — `ota get <#>` to download:
- 1) v1.2.3 delta 3 nodes 5s
- 2) v1.2.0 full 1 node 12s [downloading]
+ 1) v1.2.3 delta [yours] 3n 5s
+ 2) v1.2.0 full [other hw] 1n 12s [downloading]
 ```
+
+Each row shows the version, full-vs-delta, **whether it fits your node**, how many nodes have it, and how
+long ago it was seen. The fit marker:
+
+- **[yours]** — built for your exact hardware **and** role; safe to install.
+- **[other hw]** — a different board or role (e.g. a companion image, or another board). Don't install it.
+- **[?]** — can't tell (a build with no target id set, e.g. a bare IDE build rather than a release build).
 
 Run it again after a few seconds — discovery happens in the background, so the list fills in. Nothing is
 downloaded yet; this is just looking around. (`ota neighbors` / `ota updates` also work.)

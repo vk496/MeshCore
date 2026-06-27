@@ -1,12 +1,14 @@
 # Rolling DEV firmware release (fork convenience).
 #
 # On every push, rebuild a representative set of OTA-capable firmwares (ESP32 + nRF52, one per board family
-# plus the RAK4631 / Heltec V3 test boards in every role) and replace the assets of ONE rolling prerelease
-# (tag `dev-latest`). Each firmware ships with a full + same-image-delta `.mota` so the OTA format/transport
-# can be exercised per board. UNSIGNED dev builds for testing only.
+# plus the RAK4631 / Heltec V3 test boards in every role) and replace the `dev-latest` prerelease assets.
+# Each firmware ships a full + same-image-delta `.mota` so the OTA format/transport can be exercised per
+# board. UNSIGNED dev builds for testing only.
 #
-# `prepare` (re)creates the empty release, then each matrix build uploads its own assets to it — so one
-# board that fails to compile only loses its own cell, and there is no cross-job artifact plumbing.
+# Design (atomic, never-empty): each board builds into a workflow ARTIFACT; a final `release` job collects
+# them and ATOMICALLY recreates the release at the end. So if the run is cancelled by the next push, or some
+# boards fail to compile, the PREVIOUS release stays intact until a full new set is ready (the old "empty
+# the release first, then fill it" design left `dev-latest` empty whenever a build was cancelled/failed).
 #
 # To change which boards build, edit the `matrix.include` list below (env + its platform). Only OTA-capable
 # (ENABLE_OTA) envs make sense here. The full OTA set is ~308 envs; this is a curated ~one-per-board subset.
@@ -29,39 +31,7 @@ env:
   FIRMWARE_VERSION: dev
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Clone Repo
-        uses: actions/checkout@v6
-      - name: (Re)create the empty rolling release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
-          NOTES=$(cat <<EOF
-          **Automatic development firmware — latest commit on \`${GITHUB_REF_NAME}\`.**
-
-          - Commit: \`${GITHUB_SHA}\`
-          - Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-
-          ⚠️ Unsigned dev builds for testing only. Assets are replaced on every push (this release always
-          tracks the latest commit). Embedded firmware version string: \`dev-<short-sha>\`.
-
-          A representative set of OTA-capable boards (ESP32 + nRF52). Each firmware ships a \`.full.mota\`
-          (the flashable image) and a \`.delta.mota\` (a same-image patch — intentionally tiny — to exercise
-          the delta path: sequential on ESP32, in-place on nRF52/RAK4631).
-          EOF
-          )
-          gh release create "$RELEASE_TAG" \
-            --title "Dev firmware (latest commit)" \
-            --notes "$NOTES" \
-            --prerelease \
-            --target "$GITHUB_SHA"
-
   build:
-    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -122,17 +92,66 @@ jobs:
             --out-prefix "out/${{ matrix.env }}-${FIRMWARE_VERSION}-${SHA}" --work /tmp \
             || echo "::warning::.mota packaging failed for ${{ matrix.env }}"
 
-      - name: Upload assets to the rolling release
+      - name: Upload this board's artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: fw-${{ matrix.env }}
+          path: out
+          if-no-files-found: ignore
+          retention-days: 5
+
+  # Collect every board's artifact and ATOMICALLY (re)create the rolling release. Runs even if some boards
+  # failed (if: always()), and only touches the release once assets are in hand — so a cancelled/partial run
+  # never empties dev-latest.
+  release:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v6
+
+      - name: Collect built artifacts (via gh — no download-artifact version coupling)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "${{ github.run_id }}" --dir dist 2>/dev/null || true
+          # flatten dist/fw-<env>/<files> -> dist/
+          find dist -mindepth 2 -type f -exec mv -f -t dist {} + 2>/dev/null || true
+          find dist -mindepth 1 -type d -empty -delete 2>/dev/null || true
+          echo "Collected:"; ls -la dist || true
+
+      - name: Recreate the rolling release (only if we actually have assets)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(out/*)
+          files=(dist/*)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "::warning::no assets for ${{ matrix.env }}"; exit 0
+            echo "::error::no firmware built — leaving the existing dev-latest release untouched"
+            exit 1
           fi
-          echo "Uploading: ${files[*]}"
-          # retry once for transient API hiccups when many matrix jobs upload concurrently
-          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber \
-            || (sleep 5 && gh release upload "$RELEASE_TAG" "${files[@]}" --clobber)
+          NOTES=$(cat <<EOF
+          **Automatic development firmware — latest commit on \`${GITHUB_REF_NAME}\`.**
+
+          - Commit: \`${GITHUB_SHA}\`
+          - Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ⚠️ Unsigned dev builds for testing only. Assets are replaced on every push (this release always
+          tracks the latest commit). Embedded firmware version string: \`dev-<short-sha>\`.
+
+          A representative set of OTA-capable boards (ESP32 + nRF52). Each firmware ships a \`.full.mota\`
+          (the flashable image) and a \`.delta.mota\` (a same-image patch — intentionally tiny — to exercise
+          the delta path: sequential on ESP32, in-place on nRF52/RAK4631).
+          EOF
+          )
+          # delete + recreate so removed boards don't leave stale assets; assets are ready, so it's atomic
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$RELEASE_TAG" "${files[@]}" \
+            --title "Dev firmware (latest commit)" \
+            --notes "$NOTES" \
+            --prerelease \
+            --target "$GITHUB_SHA"

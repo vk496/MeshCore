@@ -49,6 +49,13 @@ $PY tools/mota/mota.py verify  fw_v1.16.0_delta.mota --pub signer.priv.pub --bas
 
 `build` notes:
 - `--fw` may be a plain `.bin`; the tool appends `EndF` if absent (idempotent).
+- **Self-describing identity (no flags / no filenames).** A firmware built by `pio_endf.py` carries its
+  `target_id`, `fw_version` and `hw_id` in an extended `EndF` trailer (docs/ota_protocol.md §2). `build`
+  reads them, so `--target-env`/`--fw-version`/`--hw-id` are **optional** — point `--fw` at any such `.bin`
+  (e.g. from a folder) and it packages with the right identity. Explicit flags still override.
+- **Cross-hardware delta guard.** A delta is built only if the base and target firmware have the **same**
+  `hw_id` + `target_id` (read from their `EndF`, not the filenames). A mismatch is refused with a clear
+  reason; use `--force` to override deliberately.
 - For deltas, `base_hash` is taken from the base image's `EndF` and embedded so a device can confirm
   the delta applies to its current firmware.
 - `image_hash` (full SHA-256, signed) is the security anchor checked on the reconstructed image before

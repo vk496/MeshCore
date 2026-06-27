@@ -7,6 +7,7 @@
 #include "SignerAllowlist.h"
 #include "OtaApply.h"
 #include "OtaFormat.h"
+#include "OtaSelf.h"          // ota_self_firmware() — prefer self-describing EndF identity at begin()
 #if defined(NRF52_PLATFORM) && defined(OTA_FLASH_STORE)
   #include "OtaStoreFlashNrf52.h"
 #elif defined(ESP32_PLATFORM) && defined(OTA_FLASH_STORE)
@@ -153,6 +154,14 @@ struct OtaContext {
   }
 
   void begin(uint32_t target_id, OtaSend send, void* ctx, const char* hw = nullptr) {
+    // Prefer the firmware's SELF-DESCRIBING EndF identity (docs §2) over the build-flag values the caller
+    // passed — it's correct on any build (build.sh injection, bare IDE build, ...), so `ota ls`/`status`
+    // and fetch-routing show the right hardware/role instead of 0 / "".
+    SelfFwInfo _fi;
+    if (ota_self_firmware(_fi) && _fi.valid && _fi.has_ident) {
+      if (_fi.target_id) target_id = _fi.target_id;
+      if (_fi.hw_id[0]) hw = _fi.hw_id;
+    }
     manager.begin(target_id, send, ctx);
     if (hw) { strncpy(hw_id, hw, sizeof(hw_id) - 1); hw_id[sizeof(hw_id) - 1] = 0; }
     // a node only fetches firmware it can apply: ESP32 A/B -> sequential, nRF52 single-slot -> in-place

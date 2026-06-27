@@ -43,16 +43,39 @@ def _is_nrf52() -> bool:
     return False
 
 
+def _cppdef(name):                                # value of a -D<name>=<value> build flag, or None
+    for d in env.get("CPPDEFINES", []):           # noqa: F821
+        if isinstance(d, (list, tuple)) and len(d) > 1 and d[0] == name:
+            return str(d[1])
+        if d == name:
+            return ""
+    return None
+
+
+def _firmware_ident():
+    """Self-describing identity to embed in EndF (docs/ota_protocol.md §2): target_id is computed from the
+    PlatformIO env name (so it's correct even without build.sh's -D MOTA_TARGET_ID), hw_id from MOTA_HW_ID,
+    fw_version parsed from FIRMWARE_VERSION."""
+    import re
+    target_id = ml.target_id_for_env(env["PIOENV"])           # noqa: F821
+    hw_id = (_cppdef("MOTA_HW_ID") or "").replace("\\", "").strip().strip('"').strip("'")
+    ver_s = (_cppdef("FIRMWARE_VERSION") or "").replace("\\", "").strip().strip('"').strip("'")
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", ver_s)
+    fw_version = ml.pack_version(f"{m.group(1)}.{m.group(2)}.{m.group(3) or 0}") if m else 0
+    return ml.FwIdent(fw_version=fw_version, target_id=target_id, hw_id=hw_id)
+
+
 def _append_endf(source, target, env):           # raw .bin path (ESP32 / RP2040)
     path = str(target[0])
     with open(path, "rb") as f:
         data = f.read()
-    out, h8 = ml.ensure_endf(data)
+    ident = _firmware_ident()
+    out, h8 = ml.ensure_endf(data, ident)
     if len(out) != len(data):
         with open(path, "wb") as f:
             f.write(out)
-        print(f"EndF: appended to {os.path.basename(path)} "
-              f"(body_len={len(data)} body_hash={h8.hex()})")
+        print(f"EndF: appended to {os.path.basename(path)} (body_len={len(data)} body_hash={h8.hex()} "
+              f"target={ident.target_id:#010x} hw='{ident.hw_id}' fw={ident.fw_version:#010x})")
     else:
         print(f"EndF: already present in {os.path.basename(path)} (no change)")
 
@@ -66,15 +89,17 @@ def _append_endf_hex(source, target, env):        # Intel-HEX path (nRF52: app f
         print("EndF: empty .hex, skipping"); return
     app_start, app_end = segs[0]                  # first (lowest) segment = the application image
     body = bytes(ih.tobinarray(start=app_start, size=app_end - app_start))
-    out, h8 = ml.ensure_endf(body)
+    ident = _firmware_ident()
+    out, h8 = ml.ensure_endf(body, ident)
     if len(out) == len(body):
         print(f"EndF: already present in {os.path.basename(path)} (no change)"); return
-    trailer = out[len(body):]                      # the 16-byte EndF trailer
+    trailer = out[len(body):]                      # the EndF trailer (60 bytes with identity)
     for i, b in enumerate(trailer):
         ih[app_end + i] = b                        # write it right after the app's last byte
     ih.write_hex_file(path)
     print(f"EndF: appended to {os.path.basename(path)} at 0x{app_end:X} "
-          f"(app=0x{app_start:X}.. body_len={len(body)} body_hash={h8.hex()})")
+          f"(app=0x{app_start:X}.. body_len={len(body)} body_hash={h8.hex()} "
+          f"target={ident.target_id:#010x} hw='{ident.hw_id}' fw={ident.fw_version:#010x})")
 
 
 if _ota_enabled():

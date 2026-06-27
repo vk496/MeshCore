@@ -232,6 +232,43 @@ TEST(OtaFirmwareInfo, FindsEndFInImage) {
   EXPECT_EQ(0, std::memcmp(fi.body_hash, h, 8));
 }
 
+// Build a body || EXTENDED EndF (identity-carrying), the way pio_endf / motalib do.
+static std::vector<uint8_t> make_image_v2(const std::vector<uint8_t>& body, uint32_t fw_version,
+                                          uint32_t target_id, const char* hw_id) {
+  std::vector<uint8_t> img = make_image(body);             // body + 16-byte base trailer
+  static const uint8_t EXT[4] = {'E','n','F','x'};
+  img.insert(img.end(), EXT, EXT + 4);
+  for (int i = 0; i < 4; i++) img.push_back((uint8_t)(fw_version >> (8 * i)));
+  for (int i = 0; i < 4; i++) img.push_back((uint8_t)(target_id  >> (8 * i)));
+  uint8_t hw[32] = {0}; size_t n = strlen(hw_id); if (n > 32) n = 32; memcpy(hw, hw_id, n);
+  img.insert(img.end(), hw, hw + 32);                      // -> 60-byte extended trailer
+  return img;
+}
+
+// The self-describing identity in an extended EndF is parsed; a legacy 16-byte trailer reports no identity.
+TEST(OtaFirmwareInfo, ParsesExtendedIdentity) {
+  std::vector<uint8_t> body(2000);
+  for (size_t i = 0; i < body.size(); i++) body[i] = (uint8_t)(i * 13 + 5);
+
+  auto img = make_image_v2(body, 0x01100000u, 0x04d413fdu, "RAK4631");
+  std::vector<uint8_t> region = img; region.resize(img.size() + 4096, 0xFF);
+  SelfFwInfo fi;
+  ASSERT_TRUE(find_self_firmware(region.data(), (uint32_t)region.size(), fi, /*verify_body=*/true));
+  EXPECT_EQ(fi.body_len, body.size());
+  EXPECT_EQ(fi.image_len, body.size() + 60);               // extended trailer length
+  EXPECT_TRUE(fi.has_ident);
+  EXPECT_EQ(fi.fw_version, 0x01100000u);
+  EXPECT_EQ(fi.target_id, 0x04d413fdu);
+  EXPECT_STREQ(fi.hw_id, "RAK4631");
+
+  auto img1 = make_image(body);                            // legacy 16-byte trailer
+  std::vector<uint8_t> r1 = img1; r1.resize(img1.size() + 64, 0xFF);
+  SelfFwInfo fi1;
+  ASSERT_TRUE(find_self_firmware(r1.data(), (uint32_t)r1.size(), fi1, true));
+  EXPECT_FALSE(fi1.has_ident);
+  EXPECT_EQ(fi1.image_len, body.size() + 16);
+}
+
 TEST(OtaFirmwareInfo, IgnoresStagedMotaHigherInRegion) {
   // The firmware's own EndF must win even when a staged .mota (which embeds its own EndF) sits
   // above it in the same region — the body_len == offset check disambiguates.

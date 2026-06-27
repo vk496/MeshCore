@@ -73,22 +73,36 @@ where a section names a source file, that file is the authoritative reference fo
 
 ## 2. Firmware image & the `EndF` trailer
 
-Every OTA-capable build appends a 16-byte `EndF` trailer to its flashed image so a running node can
-discover its own size/identity on any MCU (no linker symbols needed). Implemented by
+Every OTA-capable build appends an `EndF` trailer to its flashed image so a running node can discover its
+own size **and self-describing identity** on any MCU (no linker symbols needed). Implemented by
 `FirmwareInfo.cpp`; appended at build time by `tools/mota/pio_endf.py` (post-build hook).
 
 ```
 flashed image = BODY (image bytes) || EndF trailer
-EndF trailer (16 bytes):
-  off 0  4  "EndF"        45 6E 64 46
-  off 4  4  body_len      uint32 LE — length of BODY (excludes this 16-byte trailer)
-  off 8  8  body_hash     sha2-256:8 of BODY
+EndF trailer:
+  off 0   4   "EndF"        45 6E 64 46
+  off 4   4   body_len      uint32 LE — length of BODY (excludes the whole trailer)
+  off 8   8   body_hash     sha2-256:8 of BODY
+  --- the 16 bytes above are the whole (legacy) trailer; the identity block below is optional: ---
+  off 16  4   "EnFx"        45 6E 46 78 — present iff this is an extended (identity) trailer
+  off 20  4   fw_version    uint32 LE, packed MAJOR<<24|MINOR<<16|PATCH<<8|pre
+  off 24  4   target_id     uint32 LE — sha2-256:4(pio_env): hardware + role + partition (fetch routing)
+  off 28  32  hw_id         NUL-padded ASCII hardware tag (brick-safety), e.g. "RAK4631"
+  --- extended trailer = 60 bytes ---
 ```
 
-- **Size discovery:** scan flash from the partition top downward for the `EndF` marker; the byte before
-  it is the last BODY byte. (See `ota_self_firmware()`.)
-- **Delta base matching:** a node's `body_hash` is read directly from its own `EndF`; a delta's
-  `base_hash` (§5) must equal it. No self-hashing pass at match time.
+- **Self-describing identity (extended trailer).** `pio_endf.py` computes `target_id` from the PlatformIO
+  env name itself (so it's correct even without `build.sh`'s `-D MOTA_TARGET_ID`), `hw_id` from `MOTA_HW_ID`,
+  and `fw_version` from `FIRMWARE_VERSION`. The device reads them back (`ota_self_firmware()`), so a node's
+  advertised identity is correct regardless of how it was built — and the packaging tool reads them straight
+  from a raw `.bin` (no `--target-env`/`--fw-version` flags, no reliance on filenames; §9, §13).
+- **Backward-compatible:** the first 16 bytes are unchanged, so the bootloader and any legacy reader (which
+  read only `[marker, marker+16)`) are unaffected by the extension. A reader detects the extension by the
+  `EnFx` magic at `+16`; absence ⇒ a 16-byte legacy trailer (identity unknown).
+- **Size discovery:** scan flash from the partition top downward for the `EndF` marker; the byte before it
+  is the last BODY byte. The trailer is 60 bytes when `EnFx` follows, else 16. (See `ota_self_firmware()`.)
+- **Delta base matching:** a node's `body_hash` is read directly from its own `EndF`; a delta's `base_hash`
+  (§5) must equal it. `body_hash` is over BODY only, so it is identical whether the trailer is 16 or 60 bytes.
 - **No circularity:** `EndF` hashes only the BODY, never itself.
 
 The "reconstructed image" referenced by the manifest is the full `BODY || EndF` (what gets flashed).
@@ -420,12 +434,19 @@ All serving stays reactive and lowest-priority, so seeding never competes with r
 
 ## 9. Identity, trust & versioning
 
-- **`target_id`** (4 B): compile-time `sha2-256:4(pio_env_name)` (little-endian uint32), injected as
-  `-D MOTA_TARGET_ID` by `build.sh` and read via `MainBoard::getOtaTargetId()`; `tools/mota` computes the
-  same from `--target-env`. The PlatformIO env name uniquely captures hardware **and** role/partition, so a
-  node auto-fetches only matching firmware. A manual `ota pull`/`want` can override target (deliberate role
+- **`target_id`** (4 B): `sha2-256:4(pio_env_name)` (little-endian uint32). The env name uniquely captures
+  hardware **and** role/partition, so a node auto-fetches only matching firmware (a companion image is not
+  fetched onto a repeater even though it shares `hw_id`). It is **self-described in the firmware's EndF**
+  (§2, written by `pio_endf.py`) and read via `ota_self_firmware()`, so it is correct on any build; the
+  legacy `-D MOTA_TARGET_ID` / `MainBoard::getOtaTargetId()` path is the fallback. `tools/mota` reads it from
+  the firmware's EndF (or `--target-env`). A manual `ota pull`/`want` can override target (deliberate role
   switch); the `hw_id` brick-safety gate (§4) still applies at apply time.
-- **`fw_version`:** packed comparable uint32 (`MAJOR<<24 | MINOR<<16 | PATCH<<8 | pre`).
+- **`target_id` vs `hw_id`** — complementary, not redundant: `target_id` is the fetch-routing key
+  (hw + role + partition); `hw_id` is the human-readable brick-safety key (hardware only). Same board, two
+  roles ⇒ same `hw_id`, different `target_id`.
+- **`fw_version`:** packed comparable uint32 (`MAJOR<<24 | MINOR<<16 | PATCH<<8 | pre`); also self-described
+  in EndF. `ota ls` decodes it for display and flags each update `[yours]` / `[other hw]` / `[?]` by
+  comparing the advertised `target_id` to the node's own.
 - **`hw_id`:** 32-byte NUL-padded ASCII hardware tag inside the signed head. The applier refuses a `.mota`
   whose `hw_id` differs from the device's own tag (empty on either side = permissive). Brick-safety
   independent of signature.

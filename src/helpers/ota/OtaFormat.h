@@ -16,6 +16,10 @@ static const uint8_t  MOTA_MAGIC[4]    = { 'm', 'O', 'T', 'A' };   // 6D 4F 54 4
 static const uint8_t  MOTA_TRAILER[5]  = { 'v', 'k', '4', '9', '6' }; // 76 6B 34 39 36
 static const uint8_t  ENDF_MAGIC[4]    = { 'E', 'n', 'd', 'F' };   // 45 6E 64 46
 static const uint32_t ENDF_LEN         = 16;                       // marker(4)+body_len(4)+body_hash8(8)
+// Extended EndF (docs/ota_protocol.md §2): the 16-byte trailer above, then a self-describing firmware
+// identity block. The 16-byte prefix is unchanged, so the bootloader + legacy readers ignore the rest.
+static const uint8_t  ENDF_EXT_MAGIC[4] = { 'E', 'n', 'F', 'x' };  // 45 6E 46 78
+static const uint32_t ENDF_EXT_LEN     = 60;                       // +EnFx(4)+fw_version(4)+target_id(4)+hw_id(32)
 
 // ---- manifest -------------------------------------------------------------
 static const uint8_t  MOTA_FORMAT_VER  = 2;      // v2 adds hw_id[32] (a human-readable hardware tag)

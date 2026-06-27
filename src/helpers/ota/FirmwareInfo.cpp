@@ -30,6 +30,16 @@ bool find_self_firmware(const uint8_t* region, uint32_t region_len,
     out.body_len = body_len;
     out.image_len = off + ENDF_LEN;
     memcpy(out.body_hash, region + off + 8, 8);
+    // Extended EndF? An "EnFx" block right after body_hash carries self-describing identity. The trailer is
+    // then 60 bytes, so the reconstructed image extends to off + ENDF_EXT_LEN.
+    if (off + ENDF_EXT_LEN <= region_len && memcmp(region + off + 16, ENDF_EXT_MAGIC, 4) == 0) {
+      out.has_ident = true;
+      out.fw_version = rd_u32(region + off + 20);
+      out.target_id  = rd_u32(region + off + 24);
+      memcpy(out.hw_id, region + off + 28, 32);
+      out.hw_id[32] = 0;
+      out.image_len = off + ENDF_EXT_LEN;
+    }
     return true;
   }
   return false;

@@ -106,10 +106,11 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
       unsigned age = c.session_started_ms ? (unsigned)((millis() - c.session_started_ms) / 1000) : 0;
       snprintf(dl, sizeof dl, "download: %s %u/%u (%u%%) id=%s %us", state_word(fs), have, tot, pct, midhx, age);
     }
-    snprintf(reply, 160, "OTA | this fw %s (%uK) | %s | serving:%s (%u) | trusted keys:%u | target %08X",
-             selfhx, (unsigned)((s ? fi.image_len : 0) / 1024), dl,
+    const char* hw = (c.hw_id[0]) ? c.hw_id : "?";
+    snprintf(reply, 160, "OTA | this fw %s (%uK) hw=%s | %s | serving:%s (%u) | keys:%u | target:%08X",
+             selfhx, (unsigned)((s ? fi.image_len : 0) / 1024), hw, dl,
              c.serving ? "on" : "off", (unsigned)c.manager.servedCount(),
-             (unsigned)c.allow.count(), (unsigned)board.getOtaTargetId());
+             (unsigned)c.allow.count(), (unsigned)c.manager.target());
 
   // ---- what's available around me (catalogued from beacons + OTA_HAVE), best/most-recent first ----
   } else if (is_cmd(a, "neighbors|nbrs|updates|ls|n", &rest)) {
@@ -121,16 +122,19 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
     int n = snprintf(reply, CAP, "Updates nearby (%u src) — `ota get <#>` to download:",
                      (unsigned)c.manager.sourceCount());
     const uint8_t* cur = (c.manager.fetchState() != OtaManager::IDLE) ? c.manager.fetchManifestId() : nullptr;
+    uint32_t myt = c.manager.target();   // effective target (EndF identity if present, else build flag)
     uint32_t now = millis(); int shown = 0, more = 0;
     for (uint8_t i = 0; i < c.manager.catalogCount(); i++) {
       const OtaManager::CatRow* h = c.manager.catalogRow(i);
-      if (CAP - n < 40) { more++; continue; }
+      if (CAP - n < 48) { more++; continue; }
       bool on = cur && memcmp(cur, h->mid, 4) == 0;
       uint32_t age = (now - h->last_ms) / 1000; if (age > 99999) age = 99999;
       char ver[20]; ver_str(ver, sizeof ver, h->fw_version);
-      n += snprintf(reply + n, CAP - n, "\n %d) %s %s %u node%s %us%s", shown + 1, ver,
-                    codec_kind(h->codec), (unsigned)h->n_seeders, h->n_seeders == 1 ? "" : "s",
-                    (unsigned)age, on ? " [downloading]" : "");
+      // is this update for THIS node (same hw+role)? '?' when either target id is unset (e.g. a manual build)
+      const char* fit = (myt == 0 || h->target_id == 0) ? "?" : (h->target_id == myt ? "yours" : "other hw");
+      n += snprintf(reply + n, CAP - n, "\n %d) %s %s [%s] %un %us%s", shown + 1, ver,
+                    codec_kind(h->codec), fit, (unsigned)h->n_seeders, (unsigned)age,
+                    on ? " [downloading]" : "");
       shown++;
     }
     if (more && n < CAP) snprintf(reply + n, CAP - n, "\n +%d more", more);

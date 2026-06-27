@@ -13,10 +13,15 @@ namespace ota {
 
 struct SelfFwInfo {
   bool     valid = false;
-  uint32_t body_len = 0;       // firmware body length (excludes the 16-byte EndF trailer)
-  uint32_t image_len = 0;      // body_len + ENDF_LEN  (what a delta base / full image hashes over)
+  uint32_t body_len = 0;       // firmware body length (excludes the EndF trailer)
+  uint32_t image_len = 0;      // body_len + trailer length (what a delta base / full image hashes over)
   uint32_t endf_offset = 0;    // offset of the "EndF" marker within the region (== body_len)
   uint8_t  body_hash[8] = {0}; // sha2-256:8 of the body (read from EndF; == a delta's base_hash)
+  // self-describing identity (extended EndF only; has_ident=false on a legacy 16-byte trailer)
+  bool     has_ident = false;
+  uint32_t fw_version = 0;     // packed MAJOR<<24|MINOR<<16|PATCH<<8|pre
+  uint32_t target_id = 0;      // sha2-256:4(env) as uint32 — hw+role+partition (fetch routing)
+  char     hw_id[33] = {0};    // readable hardware tag (NUL-terminated), e.g. "RAK4631"
 };
 
 // Scan `region[0..region_len)` for the firmware's EndF trailer. The body starts at offset 0, so the

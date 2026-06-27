@@ -44,10 +44,22 @@ bool ota_self_firmware(SelfFwInfo& out) {
                         | ((uint32_t)buf[i+6] << 16) | ((uint32_t)buf[i+7] << 24);
       if (body_len != base + i) continue;     // must sit immediately after a body of that length
       out.valid = true;
-      out.endf_offset = base + i;
+      out.endf_offset = body_len;
       out.body_len = body_len;
       out.image_len = body_len + ENDF_LEN;
       memcpy(out.body_hash, buf + i + 8, 8);
+      // Extended identity? Re-read the full trailer at the marker (it may straddle the chunk window, so
+      // the EnFx fields aren't reliably in `buf`). docs/ota_protocol.md §2.
+      uint8_t tr[ENDF_EXT_LEN];
+      if (body_len + ENDF_EXT_LEN <= p->size &&
+          esp_partition_read(p, body_len, tr, ENDF_EXT_LEN) == ESP_OK &&
+          memcmp(tr + 16, ENDF_EXT_MAGIC, 4) == 0) {
+        out.has_ident = true;
+        out.fw_version = (uint32_t)tr[20] | ((uint32_t)tr[21]<<8) | ((uint32_t)tr[22]<<16) | ((uint32_t)tr[23]<<24);
+        out.target_id  = (uint32_t)tr[24] | ((uint32_t)tr[25]<<8) | ((uint32_t)tr[26]<<16) | ((uint32_t)tr[27]<<24);
+        memcpy(out.hw_id, tr + 28, 32); out.hw_id[32] = 0;
+        out.image_len = body_len + ENDF_EXT_LEN;
+      }
       return true;
     }
   }
@@ -96,7 +108,32 @@ static void wr_u32le(uint8_t* p, uint32_t v) {
 // Build (once) the full-image manifest + merkle leaves for the running firmware, cache them in `c`, and
 // hand the manager a flash-read callback for the payload. The image is read ONCE here to compute the
 // leaves + image_hash; thereafter a block REQ reads only that block (proof comes from the cached leaves).
+// Pack the first "MAJOR.MINOR.PATCH" found in `s` into the comparable uint32 the manifest uses
+// (MAJOR<<24 | MINOR<<16 | PATCH<<8). Returns 0 if there's no dotted number (e.g. a "dev-<sha>" build).
+static uint32_t parse_fw_version(const char* s) {
+  if (!s) return 0;
+  for (; *s; s++) {                                   // find the start of a "d.d" run
+    if (*s < '0' || *s > '9') continue;
+    const char* p = s; uint32_t a = 0, b = 0, d = 0; int dots = 0;
+    uint32_t* cur = &a;
+    for (; *p; p++) {
+      if (*p >= '0' && *p <= '9') { *cur = *cur * 10 + (uint32_t)(*p - '0'); }
+      else if (*p == '.' && dots < 2) { dots++; cur = (dots == 1) ? &b : &d; }
+      else break;
+    }
+    if (dots >= 1) return ((a & 0xFF) << 24) | ((b & 0xFF) << 16) | ((d & 0xFF) << 8);
+    s = p - 1;                                        // a bare number, no dots — keep scanning
+  }
+  return 0;
+}
+
 bool ota_serve_self(OtaContext& c, uint32_t fw_version) {
+  // Derive our version from the build string when the caller didn't supply one, so the mOTA we advertise
+  // carries a real version (was hard-coded 0 -> peers saw "v0.0.0"). A dev build with no dotted number
+  // still reads 0 — the self-describing EndF identity (docs) is the durable fix for that.
+#ifdef FIRMWARE_VERSION
+  if (fw_version == 0) fw_version = parse_fw_version(FIRMWARE_VERSION);
+#endif
   SelfFwInfo fi;
   if (!ota_self_firmware(fi) || !fi.valid) return false;
   // 1 KB logical blocks (delivered as multiple LoRa fragments): 8x fewer merkle leaves than 128 B, so a
@@ -128,16 +165,22 @@ bool ota_serve_self(OtaContext& c, uint32_t fw_version) {
   uint8_t image_hash[32]; sha.finalize(image_hash, 32);
   uint8_t root[4]; merkle_root(root, c.serve_self_leaves, bc);
 
+  // Prefer the SELF-DESCRIBING identity embedded in our own EndF (docs §2) over build flags / the param —
+  // it's correct regardless of how the firmware was built (build.sh injection, IDE, etc.).
+  uint32_t out_target = (fi.has_ident && fi.target_id) ? fi.target_id : c.manager.target();
+  uint32_t out_ver    = (fi.has_ident && fi.fw_version) ? fi.fw_version : fw_version;
+  const char* out_hw  = (fi.has_ident && fi.hw_id[0]) ? fi.hw_id : c.hw_id;
+
   uint8_t* m = c.serve_self_manifest;        // assemble v2 manifest-minus-leaves (full, unsigned) = 93 bytes
   memset(m, 0, 96);
   m[0] = MOTA_FORMAT_VER; m[1] = MFLAG_FULL; m[2] = HASH_ALGO_SHA256;
-  wr_u32le(m + 3, c.manager.target()); wr_u32le(m + 7, fw_version);
+  wr_u32le(m + 3, out_target); wr_u32le(m + 7, out_ver);
   wr_u32le(m + 11, image_size); wr_u32le(m + 15, image_size);   // full: payload == image
   m[19] = 10;                                 // block_size_log2 = 10 (1024 B logical block)
   memcpy(m + 20, root, 4);
   memcpy(m + 24, image_hash, 32);
   m[56] = CODEC_FULL;
-  memcpy(m + 57, c.hw_id, strlen(c.hw_id) < 32 ? strlen(c.hw_id) : 32);   // hw_id[32] (NUL-padded by memset)
+  memcpy(m + 57, out_hw, strlen(out_hw) < 32 ? strlen(out_hw) : 32);   // hw_id[32] (NUL-padded by memset)
   memcpy(m + 89, APPROVAL_NOT, 4);            // approval marker (fetching device's apply-gate handles it)
   return c.manager.serve_self(m, 93, c.serve_self_leaves, bc,
                               c.serve_self_proof, (size_t)bc * 4, self_read_cb, nullptr);

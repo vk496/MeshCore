@@ -109,37 +109,78 @@ def target_id_for_env(env_name: str) -> int:
 # EndF trailer
 # ---------------------------------------------------------------------------
 
-def build_endf(body: bytes) -> bytes:
-    """The 16-byte EndF trailer for a firmware BODY."""
-    return ENDF_MAGIC + struct.pack("<I", len(body)) + mh8(body)
+ENDF_EXT_MAGIC = b"EnFx"                   # marks an extended (identity-carrying) EndF trailer
+ENDF_EXT_LEN = ENDF_LEN + 4 + 4 + 4 + 32   # 16 + EnFx(4) + fw_version(4) + target_id(4) + hw_id(32) = 60
+
+
+@dataclass
+class FwIdent:
+    """Self-describing firmware identity, carried in the extended EndF trailer (docs/ota_protocol.md §2)
+    so a node / the packaging tool can read it straight from the firmware instead of relying on build
+    flags or filenames."""
+    fw_version: int = 0      # packed MAJOR<<24 | MINOR<<16 | PATCH<<8 | pre
+    target_id: int = 0       # sha2-256:4(pio_env) as uint32 LE — hw + role + partition (fetch routing)
+    hw_id: str = ""          # readable hardware tag (brick-safety), e.g. "RAK4631"
+
+
+def build_endf(body: bytes, ident: Optional["FwIdent"] = None) -> bytes:
+    """The EndF trailer for a firmware BODY: 16 bytes (legacy) or 60 bytes when `ident` is given. The
+    16-byte prefix is identical either way, so the bootloader and legacy readers (which read only the
+    first 16 bytes) are unaffected by the extension."""
+    base = ENDF_MAGIC + struct.pack("<I", len(body)) + mh8(body)
+    if ident is None:
+        return base
+    hw = ident.hw_id.encode("ascii", "replace")[:32].ljust(32, b"\0")
+    return base + ENDF_EXT_MAGIC + struct.pack("<II", ident.fw_version & 0xFFFFFFFF,
+                                               ident.target_id & 0xFFFFFFFF) + hw
+
+
+def _endf_trailer_len(image: bytes) -> int:
+    """Length of the trailing EndF (60 if extended, 16 if legacy, 0 if none/invalid)."""
+    if len(image) >= ENDF_EXT_LEN:
+        t = image[-ENDF_EXT_LEN:]
+        if (t[:4] == ENDF_MAGIC and struct.unpack("<I", t[4:8])[0] == len(image) - ENDF_EXT_LEN
+                and t[16:20] == ENDF_EXT_MAGIC and t[8:16] == mh8(image[:-ENDF_EXT_LEN])):
+            return ENDF_EXT_LEN
+    if len(image) >= ENDF_LEN:
+        t = image[-ENDF_LEN:]
+        if (t[:4] == ENDF_MAGIC and struct.unpack("<I", t[4:8])[0] == len(image) - ENDF_LEN
+                and t[8:16] == mh8(image[:-ENDF_LEN])):
+            return ENDF_LEN
+    return 0
 
 
 def has_endf(image: bytes) -> bool:
-    """True iff `image` ends with a self-consistent EndF trailer (image == BODY || EndF)."""
-    if len(image) < ENDF_LEN:
-        return False
-    trailer = image[-ENDF_LEN:]
-    if trailer[:4] != ENDF_MAGIC:
-        return False
-    body_len = struct.unpack("<I", trailer[4:8])[0]
-    if body_len != len(image) - ENDF_LEN:
-        return False
-    return trailer[8:16] == mh8(image[:-ENDF_LEN])
+    """True iff `image` ends with a self-consistent EndF trailer (legacy or extended)."""
+    return _endf_trailer_len(image) != 0
 
 
 def parse_endf(image: bytes) -> Tuple[bytes, bytes]:
     """Return (body, body_hash8) for an image that ends with a valid EndF. Raises otherwise."""
-    if not has_endf(image):
+    n = _endf_trailer_len(image)
+    if not n:
         raise ValueError("image has no valid EndF trailer")
-    return image[:-ENDF_LEN], image[-8:]
+    t = image[-n:]
+    return image[:-n], t[8:16]
 
 
-def ensure_endf(image: bytes) -> Tuple[bytes, bytes]:
-    """Return (image_with_endf, body_hash8). Appends EndF if not already present."""
+def parse_endf_ident(image: bytes) -> Optional["FwIdent"]:
+    """The self-describing identity from an extended EndF, or None for a legacy/absent trailer."""
+    if _endf_trailer_len(image) != ENDF_EXT_LEN:
+        return None
+    t = image[-ENDF_EXT_LEN:]
+    fw, tgt = struct.unpack("<II", t[20:28])
+    return FwIdent(fw, tgt, t[28:60].rstrip(b"\0").decode("ascii", "replace"))
+
+
+def ensure_endf(image: bytes, ident: Optional["FwIdent"] = None) -> Tuple[bytes, bytes]:
+    """Return (image_with_endf, body_hash8). Appends EndF (with `ident` if given) if not already present.
+    If the image already has a trailer it is kept as-is (we never rewrite an existing identity)."""
     if has_endf(image):
-        return image, image[-8:]
+        _, h8 = parse_endf(image)
+        return image, h8
     body_hash8 = mh8(image)
-    return image + build_endf(image), body_hash8
+    return image + build_endf(image, ident), body_hash8
 
 
 # ---------------------------------------------------------------------------
