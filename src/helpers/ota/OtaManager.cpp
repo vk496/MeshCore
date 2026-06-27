@@ -16,7 +16,8 @@ static void wr_u32(uint8_t* p, uint32_t v) { p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]
 void OtaManager::begin(uint32_t my_target_id, OtaSend send, void* ctx) {
   _target = my_target_id; _send = send; _ctx = ctx;
   _fstate = IDLE; _have = 0; _fbc = 0;
-  _n_serve = 0; _n_src_obj = 0; _view0.valid = false; _srcv.valid = false;
+  _n_serve = 0; _n_src_obj = 0; _view0.valid = false; _srcv.valid = false; _fetch_served = false;
+  for (uint8_t i = 0; i < 8; i++) _recent_blk[i] = 0xFFFFFFFFu;   // 0xFFFFFFFF = empty (never a real block)
 }
 
 // ---------------- serve (multi-mota registry) ----------------
@@ -58,8 +59,8 @@ void OtaManager::registerSelfEntry() {
   ServeEntry& e = _serve[0];
   memcpy(e.mid, _view0.m.merkle_root, 4);
   e.target_id = _view0.m.target_id; e.fw_version = _view0.m.fw_version;
-  e.codec_id = _view0.m.codec_id; e.flags = _view0.m.flags;
-  e.is_self = true; e.src = nullptr; e.src_idx = 0;
+  e.codec_id = _view0.m.codec_id; e.flags = _view0.m.flags; e.have_count = _view0.m.block_count;
+  e.is_self = true; e.is_fetch = false; e.src = nullptr; e.src_idx = 0;
   if (_n_serve == 0) _n_serve = 1;
 }
 
@@ -85,9 +86,17 @@ void OtaManager::refresh_sources() {
       ServeEntry& e = _serve[_n_serve++];
       memcpy(e.mid, d.mid, 4);
       e.target_id = d.target_id; e.fw_version = d.fw_version;
-      e.codec_id = d.codec_id; e.flags = d.flags;
-      e.is_self = false; e.src = src; e.src_idx = i; e.desc = d;
+      e.codec_id = d.codec_id; e.flags = d.flags; e.have_count = d.block_count;   // a folder mota is fully held
+      e.is_self = false; e.is_fetch = false; e.src = src; e.src_idx = i; e.desc = d;
     }
+  }
+  // re-seed a completed download (epidemic spread) as one more served mota, backed by the fetch store
+  if (_fetch_served && _n_serve < OTA_MAX_SERVE && serveEntryIndex(_fetch_desc.mid) < 0) {
+    ServeEntry& e = _serve[_n_serve++];
+    memcpy(e.mid, _fetch_desc.mid, 4);
+    e.target_id = _fetch_desc.target_id; e.fw_version = _fetch_desc.fw_version;
+    e.codec_id = _fetch_desc.codec_id; e.flags = _fetch_desc.flags; e.have_count = _fetch_desc.block_count;
+    e.is_self = false; e.is_fetch = true; e.src = nullptr; e.src_idx = 0; e.desc = _fetch_desc;
   }
   _srcv.valid = false;                        // a loaded source view may now be stale; reloads on demand
 }
@@ -118,20 +127,28 @@ OtaManager::ServeView* OtaManager::resolve(const uint8_t* mid) {
 // payload itself is NOT held in RAM — only the small head + the leaves, <=4 KB for <=1024 blocks.)
 bool OtaManager::loadSource(const ServeEntry& e) {
   const MotaDesc& d = e.desc;
-  if (!e.src || d.leaves_off < 8) return false;
+  if (d.leaves_off < 8) return false;
+  if (e.is_fetch ? (_fetch == nullptr) : (e.src == nullptr)) return false;
   uint16_t mfl = (uint16_t)(d.leaves_off - 8);
   if (mfl == 0 || mfl > sizeof(_src_manifest)) return false;
   if (d.block_count == 0 || (uint64_t)d.block_count * 4 > sizeof(_src_leaves)) return false;
-  if (!e.src->read(e.src_idx, 8, _src_manifest, mfl)) return false;
-  if (!mota_parse_manifest(_src_manifest, mfl, _srcv.m)) return false;
+  // read the manifest-minus-leaves + leaves[] from the backing — an external folder MotaSource, or (for a
+  // completed download we re-seed) our own fetch store. Container offsets are absolute, so a store read
+  // at the same offsets works identically.
+  bool ok = e.is_fetch ? _fetch->read(8, _src_manifest, mfl)
+                       : e.src->read(e.src_idx, 8, _src_manifest, mfl);
+  if (!ok || !mota_parse_manifest(_src_manifest, mfl, _srcv.m)) return false;
   if (memcmp(_srcv.m.merkle_root, d.mid, 4) != 0) return false;       // descriptor/bytes disagree
   if (_srcv.m.block_count != d.block_count) return false;
-  if (!e.src->read(e.src_idx, d.leaves_off, _src_leaves, d.block_count * 4)) return false;
+  ok = e.is_fetch ? _fetch->read(d.leaves_off, _src_leaves, d.block_count * 4)
+                  : e.src->read(e.src_idx, d.leaves_off, _src_leaves, d.block_count * 4);
+  if (!ok) return false;
   _srcv.m.manifest_start = _src_manifest;
   _srcv.m.leaves   = _src_leaves;
   _srcv.m.payload  = nullptr;
   _srcv.mfl = mfl;
-  _srcv_rdctx.src = e.src; _srcv_rdctx.idx = e.src_idx; _srcv_rdctx.payload_off = d.payload_off;
+  _srcv_rdctx.src = e.is_fetch ? nullptr : e.src; _srcv_rdctx.idx = e.src_idx;
+  _srcv_rdctx.payload_off = d.payload_off; _srcv_rdctx.store = e.is_fetch ? _fetch : nullptr;
   _srcv.read = srcReadTramp; _srcv.read_ctx = &_srcv_rdctx;
   _srcv.scratch = _scratch; _srcv.scratch_sz = sizeof(_scratch);
   memcpy(_srcv_mid, d.mid, 4);
@@ -139,10 +156,40 @@ bool OtaManager::loadSource(const ServeEntry& e) {
   return true;
 }
 
-// ServeReadFn trampoline: payload-relative offset -> absolute source read.
+// ServeReadFn trampoline: payload-relative offset -> absolute read of the backing (external source or fetch store).
 bool OtaManager::srcReadTramp(void* c, uint32_t off, uint8_t* buf, uint32_t len) {
   SrcReadCtx* x = (SrcReadCtx*)c;
+  if (x->store) return x->store->read(x->payload_off + off, buf, len);
   return x->src->read(x->idx, x->payload_off + off, buf, len);
+}
+
+// After a download COMPLETEs, advertise + serve the staged container so this node re-seeds it to peers
+// (epidemic spread: the origin seeds a few, they seed the next ring -> load on the origin is O(log N), not
+// O(N)). The completed container has ALL blocks + leaves, so it serves DATA *and* proofs correctly. Re-uses
+// the on-demand source view; serving is reactive + lowest-priority, so it never competes with real traffic.
+void OtaManager::serveFetched() {
+  if (!_fetch || _fstate != COMPLETE || _fbc == 0 || _floff < 8) return;
+  uint16_t mfl = (uint16_t)(_floff - 8);
+  if (mfl == 0 || mfl > sizeof(_src_manifest)) return;
+  if ((uint64_t)_fbc * 4 > sizeof(_src_leaves)) return;     // proof-gen scratch caps re-seed at <=1024 blocks
+  uint8_t head[OTA_SRC_MANIFEST_MAX];
+  if (!_fetch->read(8, head, mfl)) return;
+  MotaManifest m;
+  if (!mota_parse_manifest(head, mfl, m)) return;
+  MotaDesc& d = _fetch_desc;
+  memcpy(d.mid, _fid, 4);
+  d.target_id = m.target_id; d.fw_version = m.fw_version; d.codec_id = m.codec_id; d.flags = m.flags;
+  d.total_size = _ftotal; d.leaves_off = _floff; d.block_count = _fbc;
+  d.payload_off = _fpoff; d.payload_size = _fpsize;
+  _fetch_served = true;
+  refresh_sources();        // add the fetch entry to the catalog; the set-digest change makes the next beacon advertise it
+}
+
+void OtaManager::unserveFetched() {
+  if (!_fetch_served) return;
+  _fetch_served = false;
+  _srcv.valid = false;      // the loaded source view may be the fetch we're dropping
+  refresh_sources();
 }
 
 // sha2-256:4 over the SORTED set of mids we serve — peers use it to tell if our offering changed. Sorting
@@ -190,6 +237,8 @@ void OtaManager::handleQuery(const uint8_t* m, uint16_t n) {
     memcpy(row, e.mid, 4);
     wr_u32(row + 4, e.target_id); wr_u32(row + 8, e.fw_version);
     row[12] = e.codec_id; row[13] = e.flags;
+    uint32_t hc = e.have_count > 0xFFFFu ? 0xFFFFu : e.have_count;   // blocks we hold (awareness for fetchers)
+    row[14] = (uint8_t)(hc & 0xFF); row[15] = (uint8_t)(hc >> 8);
     nm++;
   }
   const uint8_t per = (uint8_t)((MAX_PACKET_PAYLOAD - 12) / OTA_HAVE_ROW_BYTES);  // rows per HAVE fragment
@@ -227,30 +276,66 @@ void OtaManager::handleGetManifest(const uint8_t* m, uint16_t n) {
   }
 }
 
+// Emit one block's data as self-describing DATA fragments (frag_off); the proof is fetched separately.
+void OtaManager::emitBlockData(const uint8_t* mid, uint32_t idx, const uint8_t* data, uint32_t blen) {
+  for (uint32_t fo = 0; fo < blen; fo += OTA_FRAG_DATA) {
+    uint32_t fl = (fo + OTA_FRAG_DATA <= blen) ? OTA_FRAG_DATA : (blen - fo);
+    DataMsg dm;
+    memcpy(dm.manifest_id, mid, 4);
+    dm.block_idx = (uint16_t)idx; dm.frag_off = (uint16_t)fo;
+    dm.data = data + fo; dm.data_len = (uint16_t)fl;
+    uint8_t b[MAX_PACKET_PAYLOAD];
+    emit(b, encode_data(b, sizeof(b), dm), false);
+  }
+}
+
+// True if we recently overheard ANOTHER holder broadcast this block's DATA — so we should not re-serve it
+// (avoids N sources duplicate-broadcasting one block; keeps OTA airtime minimal). See noteOverheardData().
+bool OtaManager::recentlyServed(uint32_t blk) const {
+  for (uint8_t i = 0; i < 8; i++)
+    if (_recent_blk[i] == blk && (uint32_t)(_now_ms - _recent_at[i]) < OTA_SERVE_SUPPRESS_MS) return true;
+  return false;
+}
+
+void OtaManager::noteOverheardData(const uint8_t* m, uint16_t n) {
+  DataMsg dm;
+  if (!decode_data(m, n, dm)) return;
+  _recent_blk[_recent_i] = dm.block_idx; _recent_at[_recent_i] = _now_ms;
+  _recent_i = (uint8_t)((_recent_i + 1) & 7);
+}
+
 void OtaManager::handleReq(const uint8_t* m, uint16_t n) {
   ReqMsg rq;
   if (!decode_req(m, n, rq)) return;
   ServeView* v = resolve(rq.manifest_id);
-  if (!v) return;
-  uint32_t bs = v->m.block_size();
-  for (uint32_t k = 0; k < rq.count; k++) {
-    uint32_t idx = rq.start_block + k;
-    if (idx >= v->m.block_count) break;
-    uint32_t off = idx * bs;
-    uint32_t blen = (off + bs <= v->m.payload_size) ? bs : (v->m.payload_size - off);
-    uint8_t blk[OTA_MAX_BLOCK];
-    const uint8_t* data;
-    if (v->read) { if (!v->read(v->read_ctx, off, blk, blen)) break; data = blk; }
-    else         { data = v->m.payload + off; }
-    // send the block's data as self-describing fragments (frag_off); the proof is fetched separately
-    for (uint32_t fo = 0; fo < blen; fo += OTA_FRAG_DATA) {
-      uint32_t fl = (fo + OTA_FRAG_DATA <= blen) ? OTA_FRAG_DATA : (blen - fo);
-      DataMsg dm;
-      memcpy(dm.manifest_id, v->m.merkle_root, 4);
-      dm.block_idx = (uint16_t)idx; dm.frag_off = (uint16_t)fo;
-      dm.data = data + fo; dm.data_len = (uint16_t)fl;
-      uint8_t b[MAX_PACKET_PAYLOAD];
-      emit(b, encode_data(b, sizeof(b), dm), false);
+  if (v) {                                          // serve a fully-held mota (own fw / folder / completed fetch)
+    uint32_t bs = v->m.block_size();
+    for (uint32_t k = 0; k < rq.count; k++) {
+      uint32_t idx = rq.start_block + k;
+      if (idx >= v->m.block_count) break;
+      if (recentlyServed(idx)) continue;            // another holder just broadcast it — don't duplicate
+      uint32_t off = idx * bs;
+      uint32_t blen = (off + bs <= v->m.payload_size) ? bs : (v->m.payload_size - off);
+      uint8_t blk[OTA_MAX_BLOCK];
+      const uint8_t* data;
+      if (v->read) { if (!v->read(v->read_ctx, off, blk, blen)) break; data = blk; }
+      else         { data = v->m.payload + off; }
+      emitBlockData(v->m.merkle_root, idx, data, blen);
+    }
+    return;
+  }
+  // Partial re-serve (swarm DURING the transfer): we're fetching this mid and already hold some of these
+  // blocks — serve their DATA (not proofs; we may lack sibling leaves) from our staging store, so peers can
+  // source from us, not only the origin. Reactive + lowest-priority, so real traffic is never impacted.
+  if (_fetch && _fstate == FETCHING && memcmp(rq.manifest_id, _fid, 4) == 0) {
+    for (uint32_t k = 0; k < rq.count; k++) {
+      uint32_t idx = rq.start_block + k;
+      if (idx >= _fbc) break;
+      if (!blockPresent(idx) || recentlyServed(idx)) continue;
+      uint8_t blk[OTA_MAX_BLOCK];
+      uint32_t blen = blockLen(idx);
+      if (!_fetch->read(_fpoff + idx * _fbs, blk, blen)) continue;
+      emitBlockData(_fid, idx, blk, blen);
     }
   }
 }
@@ -338,6 +423,7 @@ void OtaManager::handleHave(const uint8_t* m, uint16_t n) {
     const uint8_t* mid = row;
     uint32_t target = rd_u32(row + 4), fwver = rd_u32(row + 8);
     uint8_t codec = row[12], flags = row[13];
+    uint32_t have_count = (uint32_t)row[14] | ((uint32_t)row[15] << 8);   // this source's progress
     int slot = -1, lru = 0;                                           // upsert into the catalog (dedup by mid)
     for (int i = 0; i < _n_cat; i++) {
       if (memcmp(_catalog[i].mid, mid, 4) == 0) { slot = i; break; }
@@ -353,6 +439,7 @@ void OtaManager::handleHave(const uint8_t* m, uint16_t n) {
     }
     CatRow& c = _catalog[slot];
     c.target_id = target; c.fw_version = fwver; c.codec = codec; c.flags = flags; c.last_ms = _now_ms;
+    if (have_count > c.have_max) c.have_max = have_count;             // best-known progress among sources
     if (wantRow(mid, target, codec, flags)) startFetch(mid, target);
   }
 }
@@ -376,6 +463,7 @@ void OtaManager::startFetch(const uint8_t* mid, uint32_t target) {
   if (!_fetch || _fstate == FETCHING || _fstate == WANT_MANIFEST) return;
   if (resumeStaged(mid)) return;                 // resume a partial container left in flash
   memcpy(_fid, mid, 4);
+  _rng = (rd_u32(_seeder_id) ^ rd_u32(_fid)) | 1u;   // per-node block-pick/jitter sequence (distinct per node)
   _fstate = WANT_MANIFEST;
   _mf_total = 0; _mf_mask = 0; _mf_len = 0;       // fresh manifest reassembly
   GetManifestMsg gm; memcpy(gm.manifest_id, _fid, 4);
@@ -420,6 +508,7 @@ void OtaManager::handleManifest(const uint8_t* m, uint16_t n) {
   // a delta's whole container is staged together. (image_size at mf+11, is_full from flags at mf+1.)
   bool is_full = (mf[1] & MFLAG_FULL) != 0;
   if (!_fetch->plan_layout(is_full, rd_u32(mf + 11), payload_off, payload_size)) { _fstate = FAILED; return; }
+  unserveFetched();   // the store is about to be overwritten by this new fetch — stop re-seeding the old one
   if (!_fetch->begin(total)) { _fstate = FAILED; return; }
   // declare the metadata extent so a flash store can pin it (leaves are written all transfer long)
   if (!_fetch->set_meta_size(payload_off)) { _fstate = FAILED; return; }
@@ -436,8 +525,12 @@ void OtaManager::handleManifest(const uint8_t* m, uint16_t n) {
   // fresh transfer: clear any per-block reassembly state from a prior session
   _reasm_block = 0xFFFFFFFFu; _reasm_mask = 0; _reasm_need = 0; _awaiting_proof = false;
   _loop_last_have = 0; _loop_last_mask = 0;
+  // Swarm: hold the first REQ a random fraction of OTA_REQ_SPREAD_MS so N nodes that just discovered the
+  // same mid don't all burst-request block 0 in lockstep. loop() fires the first REQ once the hold elapses.
+  if (_rng == 0) _rng = (rd_u32(_seeder_id) ^ rd_u32(_fid)) | 1u;
+  _req_hold_at = _now_ms + (rngNext() % OTA_REQ_SPREAD_MS);
+  _peer_req_block = 0xFFFFFFFFu; _peer_req_at = 0;
   OTA_DBG("OTA: FETCHING bc=%u bs=%u total=%u\n", (unsigned)bc, (unsigned)bs, (unsigned)total);
-  requestMissing();
 }
 
 bool OtaManager::resumeStaged(const uint8_t* want_mid) {
@@ -479,7 +572,7 @@ bool OtaManager::resumeStaged(const uint8_t* want_mid) {
     } else {
       _fstate = COMPLETE;
     }
-    if (_fstate == COMPLETE) _fetch->finalize();
+    if (_fstate == COMPLETE) { _fetch->finalize(); serveFetched(); }
     return true;
   }
   _fstate = FETCHING;                                 // resume fetching the holes
@@ -551,7 +644,7 @@ void OtaManager::handleProof(const uint8_t* m, uint16_t n) {
   } else {
     _fstate = COMPLETE;   // per-block proofs already guaranteed integrity vs the root
   }
-  if (_fstate == COMPLETE) _fetch->finalize();   // commit the staged container to persistent storage
+  if (_fstate == COMPLETE) { _fetch->finalize(); serveFetched(); }   // commit + re-seed (epidemic spread)
   OTA_DBG("OTA: transfer %s\n", _fstate == COMPLETE ? "COMPLETE" : "FAILED(root)");
 }
 
@@ -570,8 +663,7 @@ void OtaManager::requestMissing() {
   // Otherwise request the DATA fragments of the next missing block. One block at a time keeps the
   // server's TX queue tiny so OTA never floods the mesh (docs/ota_protocol.md §8); a block's fragments
   // are self-describing (frag_off) so they may be served by ANY peer, BitTorrent-style.
-  uint32_t start = 0;
-  while (start < _fbc && blockPresent(start)) start++;
+  uint32_t start = pickMissingBlock();
   if (start >= _fbc) return;
   _req_start = start; _req_count = 1;
   ReqMsg rq; memcpy(rq.manifest_id, _fid, 4);
@@ -580,6 +672,51 @@ void OtaManager::requestMissing() {
   OTA_DBG("OTA: REQ block=%u (have=%u/%u mask=%04x)\n",
           (unsigned)start, (unsigned)_have, (unsigned)_fbc, (unsigned)_reasm_mask);
   emit(b, encode_req(b, sizeof(b), rq), false);
+}
+
+// Choose which block to request next. Swarm-aware so N fetchers of the same mid spread their load instead
+// of marching in lockstep on the same block:
+//  - finish an in-flight partially-reassembled block first (don't waste received fragments);
+//  - otherwise pick a RANDOM missing block (de-correlates fetchers -> they collectively pull different
+//    blocks, and every broadcast DATA fills everyone's hole);
+//  - skip a block a peer just REQ'd (its DATA is already coming over the air) unless it's all that's left.
+// Returns _fbc if nothing to request.
+uint32_t OtaManager::pickMissingBlock() const {
+  if (_fbc == 0) return _fbc;
+  // (1) keep finishing a block we've already started reassembling (recover its lost fragments)
+  if (_reasm_block < _fbc && !blockPresent(_reasm_block) && _reasm_mask != 0) return _reasm_block;
+  // (2) count missing blocks
+  uint32_t miss = 0;
+  for (uint32_t i = 0; i < _fbc; i++) if (!blockPresent(i)) miss++;
+  if (miss == 0) return _fbc;
+  bool suppress = (_peer_req_block < _fbc) && ((uint32_t)(_now_ms - _peer_req_at) < OTA_REQ_SUPPRESS_MS);
+  // (3) pick the k-th missing block (k from the per-node RNG), optionally skipping the peer-REQ'd one
+  uint32_t k = ((OtaManager*)this)->rngNext() % miss;
+  uint32_t seen = 0, chosen = _fbc, firstAny = _fbc;
+  for (uint32_t i = 0; i < _fbc; i++) {
+    if (blockPresent(i)) continue;
+    if (firstAny == _fbc) firstAny = i;
+    if (seen == k) { chosen = i; }
+    seen++;
+  }
+  if (suppress && chosen == _peer_req_block) {          // pick a different missing block than the one in flight elsewhere
+    for (uint32_t i = 0; i < _fbc; i++) {
+      uint32_t j = (chosen + 1 + i) % _fbc;
+      if (!blockPresent(j) && j != _peer_req_block) { chosen = j; break; }
+    }
+    // if the suppressed block is the ONLY one left, chosen stays == it (we still need it eventually)
+  }
+  return (chosen < _fbc) ? chosen : firstAny;
+}
+
+// Observe a peer's OTA_REQ for the mid we're fetching: its block's DATA is broadcast, so it will fill our
+// hole too — note it so pickMissingBlock() spends our next REQ on a DIFFERENT block (swarm de-dup).
+void OtaManager::noteOverheardReq(const uint8_t* m, uint16_t n) {
+  if (_fstate != FETCHING) return;
+  ReqMsg rq;
+  if (!decode_req(m, n, rq) || memcmp(rq.manifest_id, _fid, 4) != 0) return;
+  _peer_req_block = rq.start_block;
+  _peer_req_at = _now_ms;
 }
 
 void OtaManager::loop() {
@@ -596,6 +733,7 @@ void OtaManager::loop() {
     return;
   }
   if (_fstate != FETCHING) return;
+  if ((int32_t)(_now_ms - _req_hold_at) < 0) return;   // swarm: initial random hold (de-sync N fetchers)
   // retry only when a whole tick passed with NO progress — neither a committed block nor a new fragment
   // of the in-flight block. This avoids re-request spam while a block's fragments are still streaming in.
   if (_have == _loop_last_have && _reasm_mask == _loop_last_mask) requestMissing();
@@ -612,8 +750,8 @@ void OtaManager::on_message(const uint8_t* msg, uint16_t len) {
     case OTA_HAVE:         handleHave(msg, len); break;
     case OTA_GET_MANIFEST: handleGetManifest(msg, len); break;
     case OTA_MANIFEST:     handleManifest(msg, len); break;
-    case OTA_REQ:          handleReq(msg, len); break;
-    case OTA_DATA:         handleData(msg, len); break;
+    case OTA_REQ:          noteOverheardReq(msg, len); handleReq(msg, len); break;
+    case OTA_DATA:         handleData(msg, len); noteOverheardData(msg, len); break;
     case OTA_REQ_PROOF:    handleReqProof(msg, len); break;
     case OTA_PROOF:        handleProof(msg, len); break;
     default: break;

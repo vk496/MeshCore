@@ -63,6 +63,15 @@ typedef bool (*ServeReadFn)(void* ctx, uint32_t off, uint8_t* buf, uint32_t len)
 #ifndef OTA_QUERY_SPREAD_MS
 #define OTA_QUERY_SPREAD_MS 4000    // random jitter span so 50 neighbours don't all query at once (storm)
 #endif
+#ifndef OTA_REQ_SPREAD_MS
+#define OTA_REQ_SPREAD_MS 3000      // initial random hold before a fetch's first REQ (de-sync N fetchers)
+#endif
+#ifndef OTA_REQ_SUPPRESS_MS
+#define OTA_REQ_SUPPRESS_MS 2500    // after overhearing a peer's REQ for a block, don't also request it —
+#endif                              // its DATA is broadcast and will fill our hole too (swarm de-dup)
+#ifndef OTA_SERVE_SUPPRESS_MS
+#define OTA_SERVE_SUPPRESS_MS 1500  // don't re-serve a block whose DATA we just overheard another holder send
+#endif                              // (so multiple sources of the same mota don't duplicate-broadcast it)
 #ifndef OTA_FRAG_DATA
 #define OTA_FRAG_DATA 160           // data bytes per DATA fragment (<= MAX_PACKET_PAYLOAD - 9-byte header)
 #endif
@@ -97,13 +106,16 @@ public:
     uint8_t     mid[4];
     uint32_t    target_id, fw_version;
     uint8_t     codec_id, flags;
+    uint32_t    have_count;                // blocks we currently hold (== block_count when complete)
     bool        is_self;                   // true => entry is view0 (our own fw / RAM mota)
+    bool        is_fetch;                  // true => load from our own fetch store (a completed download we re-seed)
     MotaSource* src;                       // else: load from this external source ...
     uint8_t     src_idx;                   // ... at this index
-    MotaDesc    desc;                      // cached region offsets (source entries)
+    MotaDesc    desc;                      // cached region offsets (source / fetch entries)
   };
-  // Context for the source-payload reader trampoline (maps a payload-relative offset to a source read).
-  struct SrcReadCtx { MotaSource* src; uint8_t idx; uint32_t payload_off; };
+  // Context for the source-payload reader trampoline (maps a payload-relative offset to a backing read:
+  // an external MotaSource, or — when `store` is set — our own fetch store, for re-seeding a completed mota).
+  struct SrcReadCtx { MotaSource* src; uint8_t idx; uint32_t payload_off; OtaStore* store; };
 
   void begin(uint32_t my_target_id, OtaSend send, void* ctx);
 
@@ -212,6 +224,7 @@ public:
     uint8_t  codec, flags;
     uint8_t  seeder0[4];   // first source that advertised this mid
     uint8_t  n_seeders;    // distinct sources advertising it (saturates) — "N nodes have it"
+    uint32_t have_max;     // best block-count any source reported (== total when a full copy exists)
     uint32_t last_ms;
   };
   uint8_t catalogCount() const { return _n_cat; }
@@ -231,11 +244,19 @@ private:
   void handleProof(const uint8_t* m, uint16_t n);
   void startFetch(const uint8_t* mid, uint32_t target);   // begin/resume a fetch of a chosen mid
   bool wantRow(const uint8_t* mid, uint32_t target, uint8_t codec, uint8_t flags) const;  // fetch this row?
+  void noteOverheardReq(const uint8_t* m, uint16_t n);    // observe a peer's OTA_REQ (swarm de-dup)
+  uint32_t rngNext() { _rng = _rng * 1664525u + 1013904223u; return _rng; }  // per-node LCG (block pick/jitter)
+  uint32_t pickMissingBlock() const;                      // choose the next block to request (swarm-aware)
   int  serveEntryIndex(const uint8_t* mid) const;         // registry slot serving this mid (-1 if none)
   ServeView* resolve(const uint8_t* mid);                 // pick/load the ServeView for this mid (nullptr)
   bool loadSource(const ServeEntry& e);                   // load an external mota into _srcv (head+leaves)
   void registerSelfEntry();                               // (re)build entry[0] from view0
   static bool srcReadTramp(void* c, uint32_t off, uint8_t* buf, uint32_t len);  // source payload reader
+  void serveFetched();                                    // after COMPLETE: re-seed the staged mota (epidemic)
+  void unserveFetched();                                  // stop re-seeding (store about to be overwritten)
+  void emitBlockData(const uint8_t* mid, uint32_t idx, const uint8_t* data, uint32_t blen);  // DATA fragments
+  bool recentlyServed(uint32_t blk) const;                // a peer just broadcast this block's DATA?
+  void noteOverheardData(const uint8_t* m, uint16_t n);   // remember overheard DATA (serve de-dup)
   void sendQuery(const uint8_t* seeder, const uint8_t* digest, uint32_t filter_target);  // ask a source for its catalog
   void scheduleQuery(const uint8_t* seeder, const uint8_t* digest);   // jittered + suppressible
   void reDiscover() { for (uint8_t i = 0; i < _n_src; i++) _sources[i].have_catalog = false; _pq_active = false; }
@@ -257,6 +278,8 @@ private:
   uint8_t     _n_serve = 0;
   MotaSource* _src_list[OTA_MAX_SOURCE_OBJ] = {nullptr};
   uint8_t     _n_src_obj = 0;
+  bool        _fetch_served = false;                 // we re-seed our last completed download (epidemic spread)
+  MotaDesc    _fetch_desc;                            // its catalog descriptor (mid + region offsets)
   uint8_t     _src_manifest[OTA_SRC_MANIFEST_MAX];   // manifest-minus-leaves of the loaded source mota
   uint8_t     _src_leaves[OTA_PROOFGEN_SCRATCH];     // leaves[] of the loaded source mota (<=1024 blocks)
   uint8_t     _scratch[OTA_PROOFGEN_SCRATCH];        // proof-gen / fetch root-check working buffer
@@ -270,6 +293,15 @@ private:
   uint32_t   _have = 0;
   uint32_t   _req_start = 0, _req_count = 0;   // last block requested (per-block serial flow; telemetry)
   uint32_t   _loop_last_have = 0;              // for stall detection in loop()
+  // swarm load-spreading (so 50 fetchers don't all hammer the seeder for the same block in lockstep)
+  uint32_t   _rng = 0;                         // per-node LCG state (seeded from seeder_id^fid)
+  uint32_t   _req_hold_at = 0;                 // _now_ms before which we hold the first REQ (startup jitter)
+  uint32_t   _peer_req_block = 0xFFFFFFFFu;    // a block a peer just REQ'd (its broadcast DATA will fill us)
+  uint32_t   _peer_req_at = 0;                 // when we overheard it (suppression window)
+  // serve-side de-dup: blocks whose DATA we recently overheard ANOTHER holder broadcast (don't re-serve)
+  uint32_t   _recent_blk[8];
+  uint32_t   _recent_at[8] = {0};
+  uint8_t    _recent_i = 0;
   uint32_t   _desired_target = 0;              // manual cross-target override (0 = auto / own target)
   uint8_t    _desired_mid[4] = {0,0,0,0};      // pull a specific manifest_id (see want_mid)
   bool       _have_desired_mid = false;

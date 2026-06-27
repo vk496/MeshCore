@@ -34,7 +34,8 @@ struct QueryMsg {
 // ---- OTA_HAVE: the compact catalog (source -> mesh), FLOODED + tagged with set_digest so EVERY node
 // that overhears it caches the rows (passive, no query needed). Fragmented. ----
 // body: seeder_id(4) set_digest(4) frag_idx(1) frag_total(1) n_rows(1) rows[ mid(4) target(4) fwver(4) codec(1) flags(1) ]
-struct HaveRow { uint8_t mid[4]; uint32_t target_id; uint32_t fw_version; uint8_t codec_id; uint8_t flags; };
+struct HaveRow { uint8_t mid[4]; uint32_t target_id; uint32_t fw_version; uint8_t codec_id; uint8_t flags;
+                 uint16_t have_count; };   // blocks the advertiser holds (== block_count if complete; less => partial source)
 struct HaveMsg {
   uint8_t  seeder_id[4];
   uint8_t  set_digest[4];    // the offering this catalog describes (overhearers cache by it)
@@ -42,7 +43,7 @@ struct HaveMsg {
   uint8_t  n_rows;           // rows in THIS fragment
   const uint8_t* rows;       // points into buf: n_rows * OTA_HAVE_ROW_BYTES
 };
-static const uint8_t OTA_HAVE_ROW_BYTES = 14;   // mid4 + target4 + fwver4 + codec1 + flags1
+static const uint8_t OTA_HAVE_ROW_BYTES = 16;   // mid4 + target4 + fwver4 + codec1 + flags1 + have_count2
 
 // ---- OTA_GET_MANIFEST: request the manifest for a content id (direct) ----
 struct GetManifestMsg { uint8_t manifest_id[4]; };

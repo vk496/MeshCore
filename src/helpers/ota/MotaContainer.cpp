@@ -1,6 +1,7 @@
 #include "MotaContainer.h"
 #include "MerkleTree.h"
 #include "Multihash.h"
+#include "OtaByteIO.h"
 #include <string.h>
 
 namespace mesh {
@@ -14,99 +15,61 @@ bool MotaManifest::is_approved() const {
   return approval && memcmp(approval, APPROVAL_YES, 4) == 0;
 }
 
+// Read the manifest's fixed head + conditional/variable fields from a cursor (shared by the full-container
+// and standalone-manifest parsers). Reads each field by name in declaration order (docs/ota_protocol.md §4);
+// `signed_off` is the cursor base the signature is measured from (manifest_start). Leaves/payload (only in
+// a full container) are read by the caller. Returns false on any over-read or bad format_ver.
+static bool parse_manifest_fields(ByteReader& r, uint32_t signed_off, MotaManifest& out) {
+  out.format_ver = r.u8();
+  if (out.format_ver != MOTA_FORMAT_VER) return false;
+  out.flags          = r.u8();
+  out.hash_algo      = r.u8();
+  out.target_id      = r.u32();
+  out.fw_version     = r.u32();
+  out.image_size     = r.u32();
+  out.payload_size   = r.u32();
+  out.block_size_log2 = r.u8();
+  out.merkle_root    = r.take(4);
+  out.image_hash     = r.take(32);
+  out.codec_id       = r.u8();
+  out.hw_id          = r.take(32);              // 32-byte NUL-padded hardware tag (signed)
+  if (!out.is_full()) out.base_hash = r.take(8);
+  if (out.is_signed()) {
+    out.signer_pubkey = r.take(32);
+    out.signed_len = r.pos() - signed_off;      // signature covers manifest_start .. here (exclusive)
+    out.signature = r.take(64);
+  } else {
+    out.signed_len = r.pos() - signed_off;
+  }
+  out.approval = r.take(4);
+  if (!r.ok) return false;
+  if (out.block_size_log2 == 0 || out.block_size_log2 > 24 || out.payload_size == 0) return false;
+  out.block_count = (out.payload_size + out.block_size() - 1) / out.block_size();
+  return out.block_count != 0;
+}
+
 bool mota_parse(const uint8_t* buf, uint32_t len, MotaManifest& out) {
   out = MotaManifest();
   if (len < 4 + 4 + 5) return false;
   if (memcmp(buf, MOTA_MAGIC, 4) != 0) return false;
   if (memcmp(buf + len - 5, MOTA_TRAILER, 5) != 0) return false;
-  uint32_t total = rd_u32(buf + 4);
-  if (total != len) return false;
+  if (rd_u32(buf + 4) != len) return false;     // MOTA_TOTAL_SIZE must equal the actual length
 
-  const uint8_t* p = buf + 8;                 // start of manifest
-  const uint8_t* end = buf + len - 5;         // start of trailer
-  out.manifest_start = p;
-  // helper bounds check
-  #define NEED(n) do { if ((uint32_t)(end - p) < (uint32_t)(n)) return false; } while (0)
-
-  NEED(3 + 16 + 1 + 4 + 32 + 1 + 32);          // fixed head incl. hw_id[32]
-  out.format_ver = p[0];
-  if (out.format_ver != MOTA_FORMAT_VER) return false;
-  out.flags = p[1];
-  out.hash_algo = p[2];
-  out.target_id    = rd_u32(p + 3);
-  out.fw_version   = rd_u32(p + 7);
-  out.image_size   = rd_u32(p + 11);
-  out.payload_size = rd_u32(p + 15);
-  out.block_size_log2 = p[19];
-  out.merkle_root = p + 20;
-  out.image_hash  = p + 24;
-  out.codec_id    = p[56];
-  out.hw_id       = p + 57;                     // 32-byte NUL-padded hardware tag (signed)
-  p += 89;
-
-  if (out.block_size_log2 == 0 || out.block_size_log2 > 24) return false;
-  uint32_t bs = out.block_size();
-  out.block_count = (out.payload_size + bs - 1) / bs;
-  if (out.payload_size == 0 || out.block_count == 0) return false;
-
-  if (!out.is_full()) { NEED(8); out.base_hash = p; p += 8; }
-
-  if (out.is_signed()) {
-    NEED(32);  out.signer_pubkey = p; p += 32;
-    out.signed_len = (uint32_t)(p - (buf + 8));   // signature covers everything up to here
-    NEED(64);  out.signature = p; p += 64;
-  } else {
-    out.signed_len = (uint32_t)(p - (buf + 8));
-  }
-
-  NEED(4); out.approval = p; p += 4;
-
-  uint32_t leaves_bytes = out.block_count * 4;
-  NEED(leaves_bytes); out.leaves = p; p += leaves_bytes;
-
-  NEED(out.payload_size); out.payload = p; p += out.payload_size;
-
-  // payload must end exactly at the trailer
-  if (p != end) return false;
-  #undef NEED
-  return true;
+  ByteReader r(buf, len - 5);                   // everything up to (not incl.) the trailer
+  r.skip(4 + 4);                                // MAGIC + MOTA_TOTAL_SIZE (already validated)
+  out.manifest_start = buf + 8;
+  if (!parse_manifest_fields(r, 8, out)) return false;
+  out.leaves  = r.take(out.block_count * 4);
+  out.payload = r.take(out.payload_size);
+  if (!r.ok) return false;
+  return r.pos() == len - 5;                     // payload must end exactly at the trailer
 }
 
 bool mota_parse_manifest(const uint8_t* mf, uint32_t len, MotaManifest& out) {
   out = MotaManifest();
-  const uint8_t* p = mf;
-  const uint8_t* end = mf + len;
-  #define NEEDM(n) do { if ((uint32_t)(end - p) < (uint32_t)(n)) return false; } while (0)
-
-  NEEDM(89);                                   // fixed head incl. hw_id[32]
   out.manifest_start = mf;
-  out.format_ver = p[0];
-  if (out.format_ver != MOTA_FORMAT_VER) return false;
-  out.flags = p[1];
-  out.hash_algo = p[2];
-  out.target_id    = rd_u32(p + 3);
-  out.fw_version   = rd_u32(p + 7);
-  out.image_size   = rd_u32(p + 11);
-  out.payload_size = rd_u32(p + 15);
-  out.block_size_log2 = p[19];
-  out.merkle_root = p + 20;
-  out.image_hash  = p + 24;
-  out.codec_id    = p[56];
-  out.hw_id       = p + 57;                     // 32-byte NUL-padded hardware tag (signed)
-  p += 89;
-  if (!out.is_full()) { NEEDM(8); out.base_hash = p; p += 8; }
-  if (out.is_signed()) {
-    NEEDM(32); out.signer_pubkey = p; p += 32;
-    out.signed_len = (uint32_t)(p - mf);
-    NEEDM(64); out.signature = p; p += 64;
-  } else {
-    out.signed_len = (uint32_t)(p - mf);
-  }
-  NEEDM(4); out.approval = p; p += 4;
-  if (out.block_size_log2 == 0 || out.block_size_log2 > 24 || out.payload_size == 0) return false;
-  out.block_count = (out.payload_size + out.block_size() - 1) / out.block_size();
-  #undef NEEDM
-  return true;
+  ByteReader r(mf, len);                         // a standalone manifest = container bytes [8, leaves)
+  return parse_manifest_fields(r, 0, out);
 }
 
 bool mota_check_root(const MotaManifest& m) {

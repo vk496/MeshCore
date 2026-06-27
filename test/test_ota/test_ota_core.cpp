@@ -325,8 +325,8 @@ TEST(OtaProtocol, CodecRoundTrips) {
   EXPECT_EQ(q2.filter_target, 0x11223344u);
 
   // OTA_HAVE: a 2-row catalog (mid, target, fwver, codec, flags per row) tagged with the offering digest
-  uint8_t rows[2 * 14];
-  for (int i = 0; i < 2 * 14; i++) rows[i] = (uint8_t)(i + 1);
+  uint8_t rows[2 * OTA_HAVE_ROW_BYTES];
+  for (int i = 0; i < 2 * OTA_HAVE_ROW_BYTES; i++) rows[i] = (uint8_t)(i + 1);
   HaveMsg hv{{0x29,0x17,0xe4,0xf7}, {0xd1,0xd2,0xd3,0xd4}, 0, 1, 2, rows};
   n = encode_have(buf, sizeof(buf), hv);
   ASSERT_GT(n, 0); EXPECT_EQ(ota_msg_type(buf, n), OTA_HAVE);
@@ -334,7 +334,7 @@ TEST(OtaProtocol, CodecRoundTrips) {
   EXPECT_EQ(0, memcmp(h2.seeder_id, hv.seeder_id, 4));
   EXPECT_EQ(0, memcmp(h2.set_digest, hv.set_digest, 4));
   EXPECT_EQ(h2.frag_total, 1); EXPECT_EQ(h2.n_rows, 2);
-  EXPECT_EQ(0, memcmp(h2.rows, rows, 2 * 14));
+  EXPECT_EQ(0, memcmp(h2.rows, rows, 2 * OTA_HAVE_ROW_BYTES));
 
   GetManifestMsg gm{{1,2,3,4}};
   n = encode_get_manifest(buf, sizeof(buf), gm);
@@ -555,6 +555,72 @@ TEST(OtaFolder, ServesSelfPlusFolderAndFetchesExternal) {
   EXPECT_TRUE(mota_check_image_hash_full(got));
 }
 
+// --- swarm: a completed peer re-seeds beyond the origin (epidemic spread) ---------------------
+namespace {
+// A topology-aware bus: each node delivers only to its listed neighbours (so we can build multi-hop chains
+// the origin can't reach directly). DATA emits are counted per node to observe who actually sources blocks.
+struct TopoNode { int idx; };
+static std::vector<OtaManager*> g_tn;
+static std::vector<std::vector<int>> g_adj;
+static std::vector<int> g_tdata;
+static std::vector<std::pair<int, std::vector<uint8_t>>> g_tq;
+static size_t g_th = 0;
+static uint32_t g_tclk = 0;
+static void topo_send(void* ctx, const uint8_t* msg, uint16_t len, bool) {
+  int from = ((TopoNode*)ctx)->idx;
+  if (len && msg[0] == OTA_DATA) g_tdata[from]++;
+  for (int nb : g_adj[from]) g_tq.push_back({nb, std::vector<uint8_t>(msg, msg + len)});
+}
+static void topo_pump(int guard = 2000000) {
+  int idle = 0, g = 0;
+  while (g++ < guard) {
+    if (g_th < g_tq.size()) {
+      auto m = g_tq[g_th++];
+      g_tn[m.first]->on_message(m.second.data(), (uint16_t)m.second.size());
+      idle = 0;
+      if (g_th > 8192) { g_tq.erase(g_tq.begin(), g_tq.begin() + g_th); g_th = 0; }
+    } else {
+      g_tclk += 1000;
+      for (auto* nd : g_tn) { nd->set_clock(g_tclk); nd->loop(); }
+      if (g_th < g_tq.size()) { idle = 0; continue; }
+      if (++idle >= 3) break;
+    }
+  }
+}
+}
+
+// Line topology: origin <-> relay <-> leaf, with origin and leaf NOT connected. The relay fetches from the
+// origin, COMPLETEs, and re-seeds; the leaf — which can ONLY hear the relay — must then obtain the whole
+// firmware from the relay. If the leaf completes, the load provably spread off the origin (the origin never
+// served the leaf). Validates re-serve-after-complete (and the partial-re-serve serve path it shares).
+TEST(OtaSwarm, CompletedPeerReSeedsBeyondOrigin) {
+  g_tn.clear(); g_adj.clear(); g_tdata.clear(); g_tq.clear(); g_th = 0; g_tclk = 0;
+  static OtaManager origin, relay, leaf;
+  static OtaStoreRam<4096> rstore, lstore;
+  g_tn = {&origin, &relay, &leaf};
+  g_adj = {{1}, {0, 2}, {1}};     // origin<->relay<->leaf
+  g_tdata = {0, 0, 0};
+  static TopoNode t0{0}, t1{1}, t2{2};
+  uint8_t id0[4] = {1,1,1,1}, id1[4] = {2,2,2,2}, id2[4] = {3,3,3,3};
+  origin.begin(0, topo_send, &t0); origin.set_seeder_id(id0);
+  relay.begin(SIM_TARGET_ID, topo_send, &t1); relay.set_seeder_id(id1);
+  relay.set_fetch_store(&rstore); relay.set_autofetch(OtaManager::AUTOFETCH_ANY);
+  leaf.begin(SIM_TARGET_ID, topo_send, &t2); leaf.set_seeder_id(id2);
+  leaf.set_fetch_store(&lstore); leaf.set_autofetch(OtaManager::AUTOFETCH_ANY);
+
+  ASSERT_TRUE(origin.serve(SIM_MOTA, SIM_MOTA_LEN));
+  origin.announce();
+  topo_pump();
+  ASSERT_EQ(relay.fetchState(), OtaManager::COMPLETE);   // relay sourced it from the origin
+
+  relay.announce();                                      // relay now beacons its catalog (incl. the re-seeded mota)
+  topo_pump();
+  EXPECT_EQ(leaf.fetchState(), OtaManager::COMPLETE);    // leaf got it ONLY via the relay (re-serve)
+  ASSERT_EQ(lstore.staged_size(), SIM_MOTA_LEN);
+  EXPECT_EQ(0, std::memcmp(lstore.data(), SIM_MOTA, SIM_MOTA_LEN));   // byte-exact through the relay
+  EXPECT_GT(g_tdata[1], 0);                              // the relay actually served DATA (re-seeded)
+}
+
 // Fetch-resume across a reboot: a client commits some blocks, "reboots" (a fresh OtaManager on the SAME
 // persisted store), and resumeStaged() re-adopts the partial container and finishes the remaining blocks —
 // without re-fetching the manifest or the blocks already present.
@@ -657,6 +723,7 @@ static uint16_t make_have1(uint8_t* buf, uint16_t cap, const uint8_t mid[4],
   row[4]=target; row[5]=target>>8; row[6]=target>>16; row[7]=target>>24;
   row[8]=fwver; row[9]=fwver>>8; row[10]=fwver>>16; row[11]=fwver>>24;
   row[12]=codec; row[13]=flags;
+  row[14]=0; row[15]=0;   // have_count (unused in this 1-row discovery test)
   HaveMsg hv{{0xAA,0xBB,0xCC,0xDD}, {0,0,0,0}, 0, 1, 1, row};
   return encode_have(buf, cap, hv);
 }

@@ -1,11 +1,15 @@
 # Rolling DEV firmware release (fork convenience).
 #
-# On every push, rebuild ALL device firmwares and replace the assets of ONE rolling prerelease
-# (tag `dev-latest`) so other devs can always grab the current binaries from the same place. Also packages
-# a demo `.mota` (full + a same-image delta, which is tiny) so the OTA format can be exercised.
+# On every push, rebuild a representative set of OTA-capable firmwares (ESP32 + nRF52, one per board family
+# plus the RAK4631 / Heltec V3 test boards in every role) and replace the assets of ONE rolling prerelease
+# (tag `dev-latest`). Each firmware ships with a full + same-image-delta `.mota` so the OTA format/transport
+# can be exercised per board. UNSIGNED dev builds for testing only.
 #
-# These are UNSIGNED development builds for testing only — not official releases.
-# To limit which branches trigger this, add a `branches:` filter under `push:` below.
+# `prepare` (re)creates the empty release, then each matrix build uploads its own assets to it — so one
+# board that fails to compile only loses its own cell, and there is no cross-job artifact plumbing.
+#
+# To change which boards build, edit the `matrix.include` list below (env + its platform). Only OTA-capable
+# (ENABLE_OTA) envs make sense here. The full OTA set is ~308 envs; this is a curated ~one-per-board subset.
 
 name: Dev Firmware (rolling)
 
@@ -16,7 +20,6 @@ on:
 permissions:
   contents: write
 
-# Only the latest push matters — cancel any in-flight run so the release tracks HEAD.
 concurrency:
   group: dev-firmware-rolling
   cancel-in-progress: true
@@ -24,11 +27,80 @@ concurrency:
 env:
   RELEASE_TAG: dev-latest
   FIRMWARE_VERSION: dev
-  MOTA_ENV: Heltec_v3_repeater   # representative ESP32 env whose built .bin carries EndF, used for the demo .mota
 
 jobs:
-  build-and-release:
+  prepare:
     runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v6
+      - name: (Re)create the empty rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          NOTES=$(cat <<EOF
+          **Automatic development firmware — latest commit on \`${GITHUB_REF_NAME}\`.**
+
+          - Commit: \`${GITHUB_SHA}\`
+          - Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ⚠️ Unsigned dev builds for testing only. Assets are replaced on every push (this release always
+          tracks the latest commit). Embedded firmware version string: \`dev-<short-sha>\`.
+
+          A representative set of OTA-capable boards (ESP32 + nRF52). Each firmware ships a \`.full.mota\`
+          (the flashable image) and a \`.delta.mota\` (a same-image patch — intentionally tiny — to exercise
+          the delta path: sequential on ESP32, in-place on nRF52/RAK4631).
+          EOF
+          )
+          gh release create "$RELEASE_TAG" \
+            --title "Dev firmware (latest commit)" \
+            --notes "$NOTES" \
+            --prerelease \
+            --target "$GITHUB_SHA"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- nRF52 (OTA in-place; RAK4631 is the validated target, all roles) ---
+          - { env: RAK_4631_repeater,             platform: NRF52 }
+          - { env: RAK_4631_room_server,          platform: NRF52 }
+          - { env: RAK_4631_companion_radio_ble,  platform: NRF52 }
+          - { env: RAK_4631_companion_radio_usb,  platform: NRF52 }
+          # --- ESP32 test board (Heltec V3, all roles) ---
+          - { env: Heltec_v3_repeater,            platform: ESP32 }
+          - { env: Heltec_v3_room_server,         platform: ESP32 }
+          - { env: Heltec_v3_companion_radio_ble, platform: ESP32 }
+          - { env: Heltec_v3_companion_radio_usb, platform: ESP32 }
+          # --- ESP32, one representative per board family ---
+          - { env: Ebyte_EoRa-S3_room_server,           platform: ESP32 }
+          - { env: Generic_E22_sx1262_repeater,         platform: ESP32 }
+          - { env: Heltec_E213_repeater,                platform: ESP32 }
+          - { env: Heltec_E290_repeater,                platform: ESP32 }
+          - { env: Heltec_T190_repeater_,               platform: ESP32 }
+          - { env: Heltec_ct62_repeater,                platform: ESP32 }
+          - { env: Heltec_v2_repeater,                  platform: ESP32 }
+          - { env: LilyGo_T3S3_sx1262_repeater,         platform: ESP32 }
+          - { env: LilyGo_TBeam_1W_repeater,            platform: ESP32 }
+          - { env: LilyGo_TDeck_repeater,               platform: ESP32 }
+          - { env: LilyGo_TETH_Elite_sx1262_repeater,   platform: ESP32 }
+          - { env: LilyGo_TLora_V2_1_1_6_repeater,      platform: ESP32 }
+          - { env: M5Stack_Unit_C6L_repeater,           platform: ESP32 }
+          - { env: Station_G2_logging_repeater,         platform: ESP32 }
+          - { env: Station_G3_ESP32_logging_repeater,   platform: ESP32 }
+          - { env: T_Beam_S3_Supreme_SX1262_repeater,   platform: ESP32 }
+          - { env: Tbeam_SX1262_repeater,               platform: ESP32 }
+          - { env: ThinkNode_M2_room_server,            platform: ESP32 }
+          - { env: Xiao_C3_repeater,                    platform: ESP32 }
+          - { env: Xiao_S3_WIO_repeater,                platform: ESP32 }
+          - { env: heltec_tracker_v2_repeater,          platform: ESP32 }
+          - { env: heltec_v4_expansionkit_repeater,     platform: ESP32 }
+          - { env: nibble_screen_connect_repeater,      platform: ESP32 }
     steps:
       - name: Clone Repo
         uses: actions/checkout@v6
@@ -36,66 +108,31 @@ jobs:
       - name: Setup Build Environment
         uses: ./.github/actions/setup-build-environment
 
-      # build.sh is best-effort: a board that fails to compile is skipped, the rest still land in out/.
-      # All three roles append to the same out/ directory.
-      - name: Build all firmwares (companion + repeater + room-server)
-        run: |
-          /usr/bin/env bash build.sh build-companion-firmwares
-          /usr/bin/env bash build.sh build-repeater-firmwares
-          /usr/bin/env bash build.sh build-room-server-firmwares
-          echo "Built artifacts:"; ls -la out
+      - name: Build ${{ matrix.env }}
+        run: /usr/bin/env bash build.sh build-firmware ${{ matrix.env }}
 
-      - name: Package demo .mota (full + same-image delta)
+      - name: Package .mota (full + same-image delta)
         run: |
           set -euo pipefail
-          pip install --quiet detools           # delta codec only (a full .mota needs no extra deps)
-          BIN="$(ls out/${MOTA_ENV}-*.bin 2>/dev/null | grep -v -- '-merged' | head -1 || true)"
-          if [ -z "$BIN" ]; then
-            echo "::warning::no ${MOTA_ENV} .bin built — skipping demo .mota"
-          else
-            echo "Using firmware image: $BIN"
-            # full image .mota (codec 0): payload = the flashable image (BODY||EndF)
-            python3 tools/mota/mota.py build --fw "$BIN" --target-env "$MOTA_ENV" \
-              --fw-version 0.0.0 --codec full --out "out/${MOTA_ENV}-demo.full.mota"
-            # delta .mota (codec 1, sequential+crle): base == target == same image -> near-empty patch
-            python3 tools/mota/mota.py build --fw "$BIN" --base "$BIN" --target-env "$MOTA_ENV" \
-              --fw-version 0.0.1 --codec sequential --compression crle --out "out/${MOTA_ENV}-demo.delta.mota"
-            echo "Demo .mota sizes:"; ls -l out/${MOTA_ENV}-demo.*.mota
-          fi
+          pip install --quiet detools intelhex
+          SHA=$(git rev-parse --short HEAD)
+          python3 tools/mota/dev_motas.py \
+            --env "${{ matrix.env }}" --platform "${{ matrix.platform }}" \
+            --build-dir ".pio/build/${{ matrix.env }}" --target-env "${{ matrix.env }}" \
+            --out-prefix "out/${{ matrix.env }}-${FIRMWARE_VERSION}-${SHA}" --work /tmp \
+            || echo "::warning::.mota packaging failed for ${{ matrix.env }}"
 
-      - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: dev-firmwares
-          path: out
-          if-no-files-found: warn
-          retention-days: 5
-
-      - name: Replace the rolling dev release
+      - name: Upload assets to the rolling release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ -z "$(ls -A out 2>/dev/null)" ]; then
-            echo "::error::nothing built — not touching the release"; exit 1
+          shopt -s nullglob
+          files=(out/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::no assets for ${{ matrix.env }}"; exit 0
           fi
-          # delete the previous release + its tag so old binaries disappear, then recreate at HEAD
-          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
-          NOTES=$(cat <<EOF
-          **Automatic development build — latest commit on \`${GITHUB_REF_NAME}\`.**
-
-          - Commit: \`${GITHUB_SHA}\`
-          - Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-
-          ⚠️ Unsigned dev builds for testing only. The assets here are replaced on every push (this release
-          always tracks the latest commit). Embedded firmware version string: \`dev-<short-sha>\`.
-
-          \`${MOTA_ENV}-demo.full.mota\` / \`*.delta.mota\` are OTA format demos built from this run's
-          \`${MOTA_ENV}\` image (the delta is a same-image patch, so it is intentionally tiny).
-          EOF
-          )
-          gh release create "$RELEASE_TAG" out/* \
-            --title "Dev firmware (latest commit)" \
-            --notes "$NOTES" \
-            --prerelease \
-            --target "$GITHUB_SHA"
+          echo "Uploading: ${files[*]}"
+          # retry once for transient API hiccups when many matrix jobs upload concurrently
+          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber \
+            || (sleep 5 && gh release upload "$RELEASE_TAG" "${files[@]}" --clobber)

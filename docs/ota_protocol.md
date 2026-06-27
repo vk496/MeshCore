@@ -312,8 +312,12 @@ the beacon (steady state is query-free). For a single served mota, `set_digest =
 ```
 OTA_QUERY  (flood):  seeder_id[4]  set_digest[4]  filter_target(uint32)   # filter_target 0 = everything
 OTA_HAVE   (flood):  seeder_id[4]  set_digest[4]  frag_idx(1) frag_total(1) n_rows(1)  rows[]
-  HaveRow (14 bytes, OTA_HAVE_ROW_BYTES): mid[4] target_id(4) fw_version(4) codec_id(1) flags(1)
+  HaveRow (16 bytes, OTA_HAVE_ROW_BYTES): mid[4] target_id(4) fw_version(4) codec_id(1) flags(1) have_count(2)
 ```
+
+`have_count` is how many blocks the advertiser currently holds (`== block_count` for a full copy, less for a
+partial/in-progress source). It lets a fetcher see, per mid, **how many peers have it and at what progress**
+— so it knows the firmware is on multiple peers and can trust the swarm (§8.6) rather than depend on one.
 
 A node interested in a source's offering schedules a QUERY; the source replies with its full catalog as
 `OTA_HAVE` rows (fragmented if they exceed one packet — up to 12 rows per fragment). The heavy manifest is
@@ -381,6 +385,33 @@ OTA_PROOF:         manifest_id[4]  block_idx(uint16)  n_proof(1)  proof[]   # n_
 
 A served mota supports up to `OTA_MAX_BLOCK/4` leaves in the default 4 KB proof scratch (≤1024 blocks ≈ 1 MB
 payload); larger self-images pass a bigger scratch buffer.
+
+### 8.6 Swarm load distribution (don't hammer one seeder)
+
+The discovery anti-storm (§8.2) stops 50 neighbours all *querying* one node. The same hazard exists for the
+*transfer*: if one node has new firmware and 50 want it, naïve fetchers would all REQ the same blocks from
+the same seeder. Because OTA is always lowest-priority (§8) the mesh won't collapse, but the transfer would
+be needlessly slow and centralized. Mitigations (all in `OtaManager`, reusing the §8.2 jitter/suppress idea):
+
+- **Overhearing fills holes for free.** Every fetcher accepts any *broadcast* `OTA_DATA` for its mid, not
+  just data it requested. So within a broadcast neighbourhood, one peer's request serves everyone who hears it.
+- **De-correlated requests.** A fetcher picks a **random** missing block (not lowest-first), so N fetchers
+  don't lockstep on the same block; collectively they pull different blocks and everyone overhears them all.
+  Each fetch also holds its first REQ a random `OTA_REQ_SPREAD_MS` so simultaneous starters don't burst together.
+- **Request suppression.** Overhearing a peer's `OTA_REQ` for a block makes a fetcher spend its next REQ on a
+  *different* block (`OTA_REQ_SUPPRESS_MS`) — the broadcast DATA will fill the overheard one anyway.
+- **Sources multiply (the key to "don't pull one node"):**
+  - **Re-seed after COMPLETE (epidemic).** A node that finishes a download advertises + serves it (it now has
+    all blocks *and* leaves, so it serves DATA and proofs). The origin seeds a few peers, they seed the next
+    ring, etc. — load on the origin drops from O(N) to ~O(log N). (Default `autoinstall=off` means a completed
+    node lingers as a seeder until the operator applies.)
+  - **Partial re-serve during the transfer.** A still-fetching node serves the **DATA** of blocks it already
+    holds (not proofs — it may lack sibling leaves), so peers can source bytes from it, not only the origin.
+- **Serve de-dup.** A holder about to serve a block it just overheard *another* holder broadcast suppresses
+  its own send (`OTA_SERVE_SUPPRESS_MS`), so multiple sources of one mota don't duplicate-broadcast it.
+
+All serving stays reactive and lowest-priority, so seeding never competes with real traffic — the system is
+"eventually upgradable": a busy node simply delays OTA until it has spare airtime.
 
 ---
 
