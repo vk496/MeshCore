@@ -45,7 +45,8 @@ static bool parse_manifest_fields(ByteReader& r, uint32_t signed_off, MotaManife
   if (!r.ok) return false;
   if (out.block_size_log2 == 0 || out.block_size_log2 > 24 || out.payload_size == 0) return false;
   out.block_count = (out.payload_size + out.block_size() - 1) / out.block_size();
-  return out.block_count != 0;
+  // block_idx is uint16 on the wire; capping here also keeps block_count*4 (leaves length) from overflowing.
+  return out.block_count != 0 && out.block_count <= 0xFFFFu;
 }
 
 bool mota_parse(const uint8_t* buf, uint32_t len, MotaManifest& out) {

@@ -70,6 +70,24 @@ TEST(OtaParse, RejectsTampering) {
   EXPECT_FALSE(mota_parse(b.data(), b.size(), m));
 }
 
+// block_idx is a uint16 on the wire, so a manifest needing > 65535 blocks can't be addressed and must be
+// rejected at parse (this also keeps block_count*4 from overflowing the leaves-length computation).
+TEST(OtaParse, RejectsTooManyBlocks) {
+  auto manifest = [](uint32_t payload_size, uint8_t bsl) {           // minimal unsigned-full manifest (93 B)
+    std::vector<uint8_t> m(93, 0);
+    m[0] = MOTA_FORMAT_VER; m[1] = MFLAG_FULL; m[2] = 0x12;
+    m[15] = payload_size; m[16] = payload_size >> 8; m[17] = payload_size >> 16; m[18] = payload_size >> 24;
+    m[19] = bsl;
+    return m;
+  };
+  MotaManifest mm;
+  auto over = manifest(65536u * 1024u, 10);                          // 65536 blocks -> rejected
+  EXPECT_FALSE(mota_parse_manifest(over.data(), over.size(), mm));
+  auto ok = manifest(65535u * 1024u, 10);                            // 65535 blocks -> allowed
+  EXPECT_TRUE(mota_parse_manifest(ok.data(), ok.size(), mm));
+  EXPECT_EQ(mm.block_count, 65535u);
+}
+
 TEST(OtaMerkle, RootMatchesVectorAndLeaves) {
   MotaManifest m;
   ASSERT_TRUE(mota_parse(MOTA_VEC, MOTA_VEC_LEN, m));
@@ -750,6 +768,71 @@ TEST(OtaTransfer, RejectsIncompatibleCodec) {
   client.on_message(b, make_have1(b, sizeof(b), midB, SIM_TARGET_ID, 0x01000000, CODEC_DETOOLS_INPLACE, 0));
   EXPECT_EQ(client.fetchState(), OtaManager::WANT_MANIFEST);
   g_q.clear();
+}
+
+// Encode a 1-row OTA_HAVE from a specific seeder, carrying have_count (Phase-2 awareness).
+static uint16_t make_have_row(uint8_t* buf, uint16_t cap, const uint8_t mid[4], uint32_t target,
+                              uint32_t fwver, uint8_t codec, uint8_t flags,
+                              const uint8_t seeder[4], uint16_t have_count) {
+  uint8_t row[OTA_HAVE_ROW_BYTES];
+  memcpy(row, mid, 4);
+  row[4]=target; row[5]=target>>8; row[6]=target>>16; row[7]=target>>24;
+  row[8]=fwver; row[9]=fwver>>8; row[10]=fwver>>16; row[11]=fwver>>24;
+  row[12]=codec; row[13]=flags;
+  row[14]=(uint8_t)(have_count & 0xFF); row[15]=(uint8_t)(have_count >> 8);
+  HaveMsg hv; memcpy(hv.seeder_id, seeder, 4); memset(hv.set_digest, 0, 4);
+  hv.frag_idx=0; hv.frag_total=1; hv.n_rows=1; hv.rows=row;
+  return encode_have(buf, cap, hv);
+}
+
+// Catalog accounting: "N nodes have it" must count DISTINCT seeders (a repeated HAVE from one node must
+// not inflate it), and have_max tracks the best progress any source reported.
+TEST(OtaCatalog, DistinctSeederCountAndHaveCount) {
+  OtaManager m; SendTo none{&m}; m.begin(SIM_TARGET_ID, sim_send, &none);
+  uint8_t b[64]; uint8_t mid[4]={9,9,9,9};
+  uint8_t s1[4]={1,0,0,0}, s2[4]={2,0,0,0};
+  m.on_message(b, make_have_row(b, sizeof b, mid, SIM_TARGET_ID, 0x01020300, CODEC_FULL, 0, s1, 5));
+  m.on_message(b, make_have_row(b, sizeof b, mid, SIM_TARGET_ID, 0x01020300, CODEC_FULL, 0, s1, 7));  // same seeder
+  ASSERT_EQ(m.catalogCount(), 1);
+  EXPECT_EQ(m.catalogRow(0)->n_seeders, 1);          // counted once despite two HAVEs
+  EXPECT_EQ(m.catalogRow(0)->have_max, 7u);          // max progress seen
+  m.on_message(b, make_have_row(b, sizeof b, mid, SIM_TARGET_ID, 0x01020300, CODEC_FULL, 0, s2, 3));  // new seeder
+  EXPECT_EQ(m.catalogRow(0)->n_seeders, 2);
+  EXPECT_EQ(m.catalogRow(0)->have_max, 7u);          // still the max, not overwritten by the lower one
+  g_q.clear();
+}
+
+// An unanswered GET_MANIFEST must not pin the fetch slot forever: after OTA_MANIFEST_MAX_RETRY ticks with
+// no manifest, the session gives up (FAILED) so a new pull can take the slot. (Lowest-priority + bounded.)
+TEST(OtaTransfer, ManifestGiveUpAfterRetries) {
+  g_q.clear();
+  OtaManager client; OtaStoreRam<4096> store; SendTo to_none{&client};
+  client.begin(SIM_TARGET_ID, sim_send, &to_none);
+  client.set_fetch_store(&store);
+  uint8_t mid[4]={7,7,7,7};
+  client.pull(mid, SIM_TARGET_ID);                   // no server -> stuck WANT_MANIFEST
+  EXPECT_EQ(client.fetchState(), OtaManager::WANT_MANIFEST);
+  for (int i = 0; i < OTA_MANIFEST_MAX_RETRY + 2; i++) { g_clk += 5000; client.set_clock(g_clk); client.loop(); g_q.clear(); }
+  EXPECT_EQ(client.fetchState(), OtaManager::FAILED);
+}
+
+// Re-seeding a completed download must stop when the session is dropped (the staging store is cleared right
+// after), so the node never advertises a mota it can no longer serve.
+TEST(OtaSwarm, ReSeedStopsAfterDrop) {
+  g_q.clear();
+  OtaManager server, client; OtaStoreRam<4096> store;
+  SendTo to_client{&client}, to_server{&server};
+  server.begin(0, sim_send, &to_client);
+  client.begin(SIM_TARGET_ID, sim_send, &to_server);
+  client.set_fetch_store(&store);
+  client.set_autofetch(OtaManager::AUTOFETCH_ANY);
+  ASSERT_TRUE(server.serve(SIM_MOTA, SIM_MOTA_LEN));
+  server.announce();
+  pump(client);
+  ASSERT_EQ(client.fetchState(), OtaManager::COMPLETE);
+  EXPECT_EQ(client.servedCount(), 1);                // re-seeding the completed download to peers
+  client.reset_session();
+  EXPECT_EQ(client.servedCount(), 0);                // dropped -> stops advertising it
 }
 
 // --- detools delta decode (vendored detools C decoder, CRLE-only build) ----------------------

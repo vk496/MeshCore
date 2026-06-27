@@ -432,10 +432,15 @@ void OtaManager::handleHave(const uint8_t* m, uint16_t n) {
     if (slot < 0) {
       slot = (_n_cat < OTA_MAX_CATALOG) ? _n_cat++ : lru;
       _catalog[slot] = CatRow{};
-      memcpy(_catalog[slot].mid, mid, 4); memcpy(_catalog[slot].seeder0, hv.seeder_id, 4);
+      memcpy(_catalog[slot].mid, mid, 4);
+      memcpy(_catalog[slot].seeders[0], hv.seeder_id, 4);
       _catalog[slot].n_seeders = 1;
-    } else if (memcmp(_catalog[slot].seeder0, hv.seeder_id, 4) != 0 && _catalog[slot].n_seeders < 255) {
-      _catalog[slot].n_seeders++;                                    // another distinct source has it
+    } else {
+      CatRow& cc = _catalog[slot];                                   // count DISTINCT sources (no double-count)
+      bool known = false;
+      for (uint8_t k = 0; k < cc.n_seeders; k++)
+        if (memcmp(cc.seeders[k], hv.seeder_id, 4) == 0) { known = true; break; }
+      if (!known && cc.n_seeders < OTA_CAT_SEEDERS) memcpy(cc.seeders[cc.n_seeders++], hv.seeder_id, 4);
     }
     CatRow& c = _catalog[slot];
     c.target_id = target; c.fw_version = fwver; c.codec = codec; c.flags = flags; c.last_ms = _now_ms;
@@ -465,7 +470,7 @@ void OtaManager::startFetch(const uint8_t* mid, uint32_t target) {
   memcpy(_fid, mid, 4);
   _rng = (rd_u32(_seeder_id) ^ rd_u32(_fid)) | 1u;   // per-node block-pick/jitter sequence (distinct per node)
   _fstate = WANT_MANIFEST;
-  _mf_total = 0; _mf_mask = 0; _mf_len = 0;       // fresh manifest reassembly
+  _mf_total = 0; _mf_mask = 0; _mf_len = 0; _mf_retries = 0;   // fresh manifest reassembly
   GetManifestMsg gm; memcpy(gm.manifest_id, _fid, 4);
   uint8_t b[16];
   emit(b, encode_get_manifest(b, sizeof(b), gm), false);
@@ -497,6 +502,7 @@ void OtaManager::handleManifest(const uint8_t* m, uint16_t n) {
   // a block must fit our reassembly buffer (and be non-empty) — reject an oversized block_size up front
   if (bs == 0 || bs > OTA_MAX_BLOCK || payload_size == 0) { _fstate = FAILED; return; }
   uint32_t bc = (payload_size + bs - 1) / bs;
+  if (bc > 0xFFFFu) { _fstate = FAILED; return; }   // block_idx is uint16 on the wire — can't address more
   memcpy(_froot, mf + 20, 4);
 
   uint32_t leaves_off = 8 + mfl;
@@ -576,7 +582,12 @@ bool OtaManager::resumeStaged(const uint8_t* want_mid) {
     return true;
   }
   _fstate = FETCHING;                                 // resume fetching the holes
-  requestMissing();
+  // De-sync the first REQ exactly like a fresh fetch, so a coordinated reboot (whole site power-cycle)
+  // doesn't make every resuming node REQ in lockstep. loop() fires the first REQ once the hold elapses.
+  _rng = (rd_u32(_seeder_id) ^ rd_u32(_fid)) | 1u;
+  _req_hold_at = _now_ms + (rngNext() % OTA_REQ_SPREAD_MS);
+  _peer_req_block = 0xFFFFFFFFu; _peer_req_at = 0;
+  _loop_last_have = _have; _loop_last_mask = _reasm_mask;   // "no progress yet" -> loop will request after the hold
   return true;
 }
 
@@ -726,7 +737,9 @@ void OtaManager::loop() {
     sendQuery(_pq_seeder, _pq_digest, 0);    // unfiltered: one broadcast HAVE serves everyone
   }
   if (_fstate == WANT_MANIFEST) {
-    // the MANIFEST reply may have been lost on a marginal link — retry GET_MANIFEST
+    // the MANIFEST reply may have been lost on a marginal link — retry GET_MANIFEST, but give up after a
+    // cap so an unreachable mid doesn't pin the single fetch slot (or emit) forever.
+    if (++_mf_retries > OTA_MANIFEST_MAX_RETRY) { _fstate = FAILED; return; }
     GetManifestMsg gm; memcpy(gm.manifest_id, _fid, 4);
     uint8_t b[16];
     emit(b, encode_get_manifest(b, sizeof(b), gm), false);

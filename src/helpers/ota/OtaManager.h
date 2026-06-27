@@ -42,6 +42,9 @@ typedef bool (*ServeReadFn)(void* ctx, uint32_t off, uint8_t* buf, uint32_t len)
 #ifndef OTA_MF_MAXFRAG
 #define OTA_MF_MAXFRAG 4            // max manifest fragments (a signed v2 manifest is ~2)
 #endif
+#ifndef OTA_MANIFEST_MAX_RETRY
+#define OTA_MANIFEST_MAX_RETRY 20   // give up (FAILED) after this many GET_MANIFEST retries — frees the slot
+#endif
 #ifndef OTA_MAX_SOURCES
 #define OTA_MAX_SOURCES 12          // heard OTA sources (beacon senders) tracked (LRU); ~12 B each
 #endif
@@ -204,12 +207,15 @@ public:
   void on_message(const uint8_t* msg, uint16_t len);   // feed one received OTA message
   void loop();                                         // drive fetch (re-request missing blocks)
 
-  // Drop the current fetch session back to IDLE (so a fresh `ota pull` / advert starts a new one).
+  // Drop the current fetch session back to IDLE (so a fresh `ota pull` / advert starts a new one). Also
+  // stops re-seeding a previously-completed download — callers clear the staging store right after, so the
+  // re-seed view would otherwise advertise a mota we can no longer serve.
   void reset_session() {
-    _fstate = IDLE; _have = 0; _req_count = 0;
+    _fstate = IDLE; _have = 0; _req_count = 0; _mf_retries = 0;
     _reasm_block = 0xFFFFFFFFu; _reasm_mask = 0; _reasm_need = 0; _awaiting_proof = false;
     _loop_last_have = 0; _loop_last_mask = 0;
     _mf_total = 0; _mf_mask = 0; _mf_len = 0;
+    unserveFetched();
   }
 
   FetchState fetchState() const { return _fstate; }
@@ -218,13 +224,14 @@ public:
   const uint8_t* fetchManifestId() const { return _fid; }
 
   // --- discovery catalog (for `ota neighbors`): mOTAs heard around us via OTA_HAVE, deduped by mid ---
+  static const uint8_t OTA_CAT_SEEDERS = 4;   // distinct sources tracked per catalog row (for "N nodes have it")
   struct CatRow {
     uint8_t  mid[4];
     uint32_t target_id, fw_version;
     uint8_t  codec, flags;
-    uint8_t  seeder0[4];   // first source that advertised this mid
-    uint8_t  n_seeders;    // distinct sources advertising it (saturates) — "N nodes have it"
-    uint32_t have_max;     // best block-count any source reported (== total when a full copy exists)
+    uint8_t  seeders[OTA_CAT_SEEDERS][4];  // distinct sources advertising this mid (deduped; capped)
+    uint8_t  n_seeders;                    // count of the above (capped at OTA_CAT_SEEDERS) — "N+ nodes have it"
+    uint32_t have_max;                     // best block-count any source reported (== total when a full copy exists)
     uint32_t last_ms;
   };
   uint8_t catalogCount() const { return _n_cat; }
@@ -319,7 +326,8 @@ private:
   uint16_t   _loop_last_mask = 0;              // fragment-level stall detection in loop()
   uint8_t    _reasm_buf[OTA_MAX_BLOCK];
   // multi-fragment manifest reassembly (a signed v2 manifest exceeds one packet)
-  uint8_t    _mf_buf[256];
+  uint8_t    _mf_buf[OTA_MF_MAXFRAG * OTA_MF_FRAG];   // sized to the fragment cap so no valid manifest is silently dropped
+  uint16_t   _mf_retries = 0;                          // GET_MANIFEST retries while WANT_MANIFEST (give up after a cap)
   uint8_t    _mf_total = 0;                    // frag_total of the manifest being reassembled (0 = none)
   uint16_t   _mf_mask = 0;                     // received manifest-fragment bitmap
   uint32_t   _mf_len = 0;                      // assembled manifest length (set by the last fragment)

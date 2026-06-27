@@ -28,9 +28,42 @@ static char fstate_char(OtaManager::FetchState s) {
   }
 }
 
-static const char* codec_name(uint8_t c) {
-  return c == CODEC_FULL ? "full" : (c == CODEC_DETOOLS_SEQUENTIAL ? "seq"
-       : (c == CODEC_DETOOLS_INPLACE ? "inpl" : "?"));
+// For users, the only distinction that matters is full image vs. delta (which delta codec is internal).
+static const char* codec_kind(uint8_t c) { return c == CODEC_FULL ? "full" : "delta"; }
+
+// A plain-language word for the fetch state (shown in `ota status`).
+static const char* state_word(OtaManager::FetchState s) {
+  switch (s) {
+    case OtaManager::IDLE:          return "idle";
+    case OtaManager::WANT_MANIFEST: return "starting";
+    case OtaManager::FETCHING:      return "downloading";
+    case OtaManager::COMPLETE:      return "ready to install";
+    case OtaManager::FAILED:        return "failed";
+    default:                        return "?";
+  }
+}
+
+// Decode the packed fw_version (MAJOR<<24 | MINOR<<16 | PATCH<<8 | pre) into "v1.2.3" (or ".pre").
+static void ver_str(char* out, size_t cap, uint32_t v) {
+  unsigned maj = v >> 24, min = (v >> 16) & 0xFF, pat = (v >> 8) & 0xFF, pre = v & 0xFF;
+  if (pre) snprintf(out, cap, "v%u.%u.%u.%u", maj, min, pat, pre);
+  else     snprintf(out, cap, "v%u.%u.%u", maj, min, pat);
+}
+
+// Match the first word of `a` against any of the '|'-separated names (so commands have intuitive aliases
+// and short forms); on a match, point `*rest` at the argument text. Keeps the dispatch table readable.
+static bool is_cmd(const char* a, const char* names, const char** rest) {
+  size_t tlen = 0; while (a[tlen] && a[tlen] != ' ') tlen++;
+  for (const char* s = names; *s; ) {
+    const char* d = s; while (*d && *d != '|') d++;
+    if ((size_t)(d - s) == tlen && tlen && strncmp(a, s, tlen) == 0) {
+      const char* r = a + tlen; while (*r == ' ') r++;
+      if (rest) *rest = r;
+      return true;
+    }
+    s = (*d == '|') ? d + 1 : d;
+  }
+  return false;
 }
 
 // The everyday OTA surface is BitTorrent-shaped: `ota` shows what you're holding (your running firmware
@@ -45,54 +78,68 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
   if (*a != 0 && *a != ' ') return false;
   while (*a == ' ') a++;
   OtaContext& c = ota_ctx();
+  const char* rest = a;
 
   // ---- raw / internal primitives, tucked under `ota dev ...` ----
-  if (strncmp(a, "dev", 3) == 0 && (a[3] == 0 || a[3] == ' ')) {
-    const char* d = a + 3; while (*d == ' ') d++;
-    return handle_dev(d, reply, c);
+  if (is_cmd(a, "dev", &rest)) {
+    return handle_dev(rest, reply, c);
   }
 
+  // ---- help: list the commands in plain words (aliases in parentheses) ----
+  if (is_cmd(a, "help|?|h", &rest)) {
+    snprintf(reply, 160,
+      "OTA: status | ls=find updates | get <#>=download | install | cancel | announce | self | "
+      "folder | config | key. Try `ota ls`.");
+
   // ---- inventory dashboard: running fw (self), the one fetch session, serving state ----
-  if (*a == 0 || strncmp(a, "status", 6) == 0) {
+  } else if (*a == 0 || is_cmd(a, "status|st", &rest)) {
     SelfFwInfo fi; bool s = ota_self_firmware(fi);
     char selfhx[9]; if (s && fi.valid) mesh::Utils::toHex(selfhx, fi.body_hash, 4); else strcpy(selfhx, "?");
     OtaManager::FetchState fs = c.manager.fetchState();
-    char midhx[9]; strcpy(midhx, "-");
-    if (fs != OtaManager::IDLE) mesh::Utils::toHex(midhx, c.manager.fetchManifestId(), 4);
-    unsigned age = (fs != OtaManager::IDLE && c.session_started_ms) ? (unsigned)((millis() - c.session_started_ms) / 1000) : 0;
-    sprintf(reply, "OTA tgt=%08X fw=%s | self:%s%uK | sess:%c %u/%u mid=%s age=%us | serv:%s keys=%u",
-            (unsigned)board.getOtaTargetId(), selfhx, s ? "full " : "?",
-            (unsigned)((s ? fi.image_len : 0) / 1024), fstate_char(fs),
-            (unsigned)c.manager.blocksHave(), (unsigned)c.manager.blocksTotal(),
-            midhx, age, c.serving ? "on" : "off", (unsigned)c.allow.count());
+    char dl[80];
+    if (fs == OtaManager::IDLE) {
+      strcpy(dl, "no download");
+    } else {
+      char midhx[9]; mesh::Utils::toHex(midhx, c.manager.fetchManifestId(), 4);
+      unsigned have = (unsigned)c.manager.blocksHave(), tot = (unsigned)c.manager.blocksTotal();
+      unsigned pct = tot ? (unsigned)((uint64_t)have * 100 / tot) : 0;
+      unsigned age = c.session_started_ms ? (unsigned)((millis() - c.session_started_ms) / 1000) : 0;
+      snprintf(dl, sizeof dl, "download: %s %u/%u (%u%%) id=%s %us", state_word(fs), have, tot, pct, midhx, age);
+    }
+    snprintf(reply, 160, "OTA | this fw %s (%uK) | %s | serving:%s (%u) | trusted keys:%u | target %08X",
+             selfhx, (unsigned)((s ? fi.image_len : 0) / 1024), dl,
+             c.serving ? "on" : "off", (unsigned)c.manager.servedCount(),
+             (unsigned)c.allow.count(), (unsigned)board.getOtaTargetId());
 
   // ---- what's available around me (catalogued from beacons + OTA_HAVE), best/most-recent first ----
-  } else if (strncmp(a, "neighbors", 9) == 0 || strncmp(a, "nbrs", 4) == 0) {
+  } else if (is_cmd(a, "neighbors|nbrs|updates|ls|n", &rest)) {
     // Kick a fresh round of catalog queries (async — rows arrive over the next seconds); render what we
-    // have now. The reply buffer is 160 B (serial / one LoRa packet for remote-admin) so writes are bounded.
+    // have now in plain words. The reply buffer is 160 B (serial / one LoRa packet for remote-admin), so
+    // writes are bounded and extra rows collapse to "+N more".
     c.manager.queryAll();
     const int CAP = 160;
-    int n = snprintf(reply, CAP, "nbrs #:mid t=tgt codec seed age *=cur (src=%u)", (unsigned)c.manager.sourceCount());
+    int n = snprintf(reply, CAP, "Updates nearby (%u src) — `ota get <#>` to download:",
+                     (unsigned)c.manager.sourceCount());
     const uint8_t* cur = (c.manager.fetchState() != OtaManager::IDLE) ? c.manager.fetchManifestId() : nullptr;
     uint32_t now = millis(); int shown = 0, more = 0;
     for (uint8_t i = 0; i < c.manager.catalogCount(); i++) {
       const OtaManager::CatRow* h = c.manager.catalogRow(i);
-      if (CAP - n < 60) { more++; continue; }
-      char midhx[9]; mesh::Utils::toHex(midhx, h->mid, 4);
+      if (CAP - n < 40) { more++; continue; }
       bool on = cur && memcmp(cur, h->mid, 4) == 0;
       uint32_t age = (now - h->last_ms) / 1000; if (age > 99999) age = 99999;
-      n += snprintf(reply + n, CAP - n, "\n %d:%s t=%08X %s seed=%u %us%s", shown + 1, midhx,
-                    (unsigned)h->target_id, codec_name(h->codec), (unsigned)h->n_seeders,
-                    (unsigned)age, on ? "*" : "");
+      char ver[20]; ver_str(ver, sizeof ver, h->fw_version);
+      n += snprintf(reply + n, CAP - n, "\n %d) %s %s %u node%s %us%s", shown + 1, ver,
+                    codec_kind(h->codec), (unsigned)h->n_seeders, h->n_seeders == 1 ? "" : "s",
+                    (unsigned)age, on ? " [downloading]" : "");
       shown++;
     }
     if (more && n < CAP) snprintf(reply + n, CAP - n, "\n +%d more", more);
-    if (shown == 0) strcpy(reply, "nbrs: none yet — sources beacon periodically; re-run in a few s (queried now)");
+    if (shown == 0) strcpy(reply, "No updates seen yet — re-run `ota ls` in a few seconds (just asked around).");
 
   // ---- start fetching a specific catalogued mOTA (by list index or manifest_id) ----
-  } else if (strncmp(a, "pull", 4) == 0 && (a[4] == 0 || a[4] == ' ')) {
-    const char* p = a + 4; while (*p == ' ') p++;
-    if (*p == 0) { strcpy(reply, "usage: ota pull <#|mid8>  (see `ota neighbors`)"); return true; }
+  } else if (is_cmd(a, "pull|get|download", &rest)) {
+    const char* p = rest;
+    if (*p == 0) { strcpy(reply, "usage: ota get <#>   (see the numbers in `ota ls`)"); return true; }
     const OtaManager::CatRow* sel = nullptr; uint8_t mid[4];
     if (*p == '#' || (p[0] >= '1' && p[0] <= '9' && (p[1] == 0 || p[1] == ' '))) {   // index among catalogue
       int idx = atoi(*p == '#' ? p + 1 : p);
@@ -101,7 +148,7 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
       for (uint8_t i = 0; i < c.manager.catalogCount(); i++)
         if (memcmp(c.manager.catalogRow(i)->mid, mid, 4) == 0) { sel = c.manager.catalogRow(i); break; }
     }
-    if (!sel) { strcpy(reply, "ERR no such neighbor (see `ota neighbors`)"); return true; }
+    if (!sel) { strcpy(reply, "ERR no such update (see the numbers in `ota ls`)"); return true; }
     if (c.apply_pending) { strcpy(reply, "ERR busy applying"); return true; }
     uint8_t selmid[4]; uint32_t seltgt = sel->target_id; memcpy(selmid, sel->mid, 4);   // sel may move on reset
     c.manager.reset_session(); c.fetch_store.clear();
@@ -110,7 +157,7 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
     sprintf(reply, "OK pulling mid=%s target=%08X (low priority)", midhx, (unsigned)seltgt);
 
   // ---- discard the current session (e.g. a stalled old fetch) to free the slot ----
-  } else if (strncmp(a, "drop", 4) == 0) {
+  } else if (is_cmd(a, "drop|cancel|stop", &rest)) {
     OtaManager::FetchState fs = c.manager.fetchState();
     char midhx[9]; strcpy(midhx, "-");
     if (fs != OtaManager::IDLE) mesh::Utils::toHex(midhx, c.manager.fetchManifestId(), 4);
@@ -120,19 +167,19 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
 
   // ---- broadcast our tiny beacon so peers discover us. If not already serving, set up flash-backed
   //      self-serve first (so we're a real, fetchable source of our own running firmware). ----
-  } else if (strncmp(a, "announce", 8) == 0) {
+  } else if (is_cmd(a, "announce|adv", &rest)) {
     if (!c.serving) c.serving = ota_serve_self(c, 0);
     c.manager.announce();
     sprintf(reply, "OK beacon sent (serving=%s)", c.serving ? "self fw" : "nothing");
 
   // ---- running firmware identity (compare against a delta's base_hash) ----
-  } else if (strncmp(a, "self", 4) == 0) {
+  } else if (is_cmd(a, "self|id", &rest)) {
     SelfFwInfo fi;
     if (!ota_self_firmware(fi) || !fi.valid) { strcpy(reply, "ERR no EndF (firmware lacks the trailer?)"); return true; }
     char hx[17]; mesh::Utils::toHex(hx, fi.body_hash, 8);
     sprintf(reply, "self body=%u image=%u base_hash=%s", (unsigned)fi.body_len, (unsigned)fi.image_len, hx);
 
-  } else if (strncmp(a, "applydelta", 10) == 0) {
+  } else if (is_cmd(a, "install|apply|applydelta", &rest)) {
     // Apply the fetched update. Destructive (reflashes + reboots) and GATED, not interactive (no "type
     // yes" round-trip — unreliable over LoRa): refuse unless the fetch is COMPLETE, then the apply path
     // validates in order (payload hash -> built-for-this-firmware -> signature/trust) and returns the
@@ -151,8 +198,8 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
 
   // ---- external folder relay: advertise + serve `.mota` from a host daemon over the seeder UART, so the
   //      node hosts MANY images (any architecture) it doesn't hold in flash. Trustless (fetchers verify). --
-  } else if (strncmp(a, "folder", 6) == 0) {
-    const char* p = a + 6; while (*p == ' ') p++;
+  } else if (is_cmd(a, "folder|fold", &rest)) {
+    const char* p = rest;
     if (strncmp(p, "on", 2) == 0) {
 #if defined(OTA_FOLDER_SERIAL)
       if (!c.serving) c.serving = ota_serve_self(c, 0);   // keep serving our own fw alongside the folder
@@ -176,8 +223,8 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
     }
 
   // ---- policy config (persisted via NodePrefs). conservative defaults: autofetch/autoinstall off ----
-  } else if (strncmp(a, "config", 6) == 0) {
-    const char* p = a + 6; while (*p == ' ') p++;
+  } else if (is_cmd(a, "config|cfg|set", &rest)) {
+    const char* p = rest;
     if (strncmp(p, "autofetch ", 10) == 0) {
       const char* v = p + 10;
       uint8_t pol = strncmp(v, "any", 3) == 0    ? OtaManager::AUTOFETCH_ANY
@@ -204,24 +251,28 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
               (unsigned)c.manager.checkpoint_blocks(), (unsigned)c.allow.count());
     }
 
-  // ---- trusted signer allowlist (security config; persisted) ----
-  } else if (strncmp(a, "key add ", 8) == 0) {
-    uint8_t pub[32];
-    if (mesh::Utils::fromHex(pub, 32, a + 8) && c.allow.add(pub)) { c.config_dirty = true; strcpy(reply, "OK key added (saved)"); }
-    else strcpy(reply, "ERR key");
-  } else if (strncmp(a, "key list", 8) == 0) {
-    int n = sprintf(reply, "keys=%u:", (unsigned)c.allow.count());
-    for (uint8_t i = 0; i < c.allow.count() && n < 140; i++) {
-      char hx[17]; mesh::Utils::toHex(hx, c.allow.get(i), 8);
-      n += sprintf(reply + n, " %s", hx);
+  // ---- trusted signer allowlist (security config; persisted): `ota key add|rm <hex>` / `ota key` lists ----
+  } else if (is_cmd(a, "key|keys", &rest)) {
+    const char* p = rest;
+    if (strncmp(p, "add ", 4) == 0) {
+      uint8_t pub[32];
+      if (mesh::Utils::fromHex(pub, 32, p + 4) && c.allow.add(pub)) { c.config_dirty = true; strcpy(reply, "OK key added (saved)"); }
+      else strcpy(reply, "ERR key");
+    } else if (strncmp(p, "rm ", 3) == 0 || strncmp(p, "remove ", 7) == 0) {
+      uint8_t pub[32]; const char* h = p + (p[0] == 'r' && p[1] == 'm' ? 3 : 7);
+      if (mesh::Utils::fromHex(pub, 32, h) && c.allow.remove(pub)) { c.config_dirty = true; strcpy(reply, "OK removed (saved)"); }
+      else strcpy(reply, "ERR");
+    } else {                                              // bare `ota key` (or `key list`) -> show them
+      int n = snprintf(reply, 160, "trusted signer keys (%u):", (unsigned)c.allow.count());
+      for (uint8_t i = 0; i < c.allow.count() && n < 140; i++) {
+        char hx[17]; mesh::Utils::toHex(hx, c.allow.get(i), 8);
+        n += snprintf(reply + n, 160 - n, " %s", hx);
+      }
+      if (c.allow.count() == 0) strcpy(reply, "no trusted signer keys yet (add one with `ota key add <hex>`)");
     }
-  } else if (strncmp(a, "key rm ", 7) == 0) {
-    uint8_t pub[32];
-    if (mesh::Utils::fromHex(pub, 32, a + 7) && c.allow.remove(pub)) { c.config_dirty = true; strcpy(reply, "OK removed (saved)"); }
-    else strcpy(reply, "ERR");
 
   } else {
-    strcpy(reply, "ota: status|neighbors|announce|pull <#|mid>|drop|folder|config|self|applydelta|key|dev");
+    strcpy(reply, "Unknown OTA command. Type `ota help`.");
   }
   return true;
 }

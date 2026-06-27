@@ -5,6 +5,9 @@ written for developers who want to implement an interoperable peer (server, fetc
 in another codebase or project. Everything below is implemented and hardware-verified in this repository;
 where a section names a source file, that file is the authoritative reference for byte-level details.
 
+> **Just want to update your node?** See the plain-language [OTA user guide](ota_user_guide.md) — this
+> document is the technical/wire specification.
+
 **Design goals**
 
 - Distribute firmware over LoRa as a **self-verifying, resumable, BitTorrent-style block transfer** that
@@ -498,17 +501,23 @@ Heltec V3 over one USB cable, every block merkle-checked.
 User-facing OTA data should travel via `CMD_OTA_*` companion binary frames; the text CLI below is
 debug/operator oriented and replies are `snprintf`-bounded into a 160-byte buffer.
 
+Commands take intuitive aliases (matched by the first word; see `is_cmd` in `OtaCli.cpp`) so they're easy
+to type and read — `status`/`neighbors`/`pull`/`drop`/`applydelta` are the canonical names, the aliases are
+the recommended user-facing forms. Output is plain-language (a user-facing guide lives at
+[ota_user_guide.md](ota_user_guide.md)).
+
 ```
-ota status                         session + self-fw summary
-ota neighbors                      discovered mOTAs (queries sources; rows arrive async via OTA_HAVE)
-ota announce                       serve self + send a beacon now
-ota pull <#|mid8>                  fetch a chosen mOTA (manual; works regardless of autofetch)
-ota drop                           drop the current fetch session (free the slot)
-ota folder on|off                  attach/detach an external .mota folder (host daemon) ; bare = list
-ota self                           print this firmware's EndF (body/image size, base_hash)
-ota applydelta                     verify + approve + (ESP32) apply / (nRF52) reboot-to-bootloader
-ota config [autofetch|autoinstall|checkpoint] ...    show/set persisted policy
-ota key add|list|rm <hex>          trusted signer allowlist
+ota help | ?                       list the commands
+ota status | st  (or bare `ota`)   plain-language: running fw, the one fetch session (state/%/id), serving, keys
+ota ls | neighbors | nbrs | updates | n   discovered updates (queries sources; rows arrive async via OTA_HAVE)
+ota get | pull | download <#|mid8> fetch a chosen mOTA (manual; works regardless of autofetch)
+ota install | apply | applydelta   verify + approve + (ESP32) apply / (nRF52) reboot-to-bootloader
+ota cancel | drop | stop           drop the current fetch session (frees the slot; stops re-seeding)
+ota announce | adv                 serve self + send a beacon now
+ota self | id                      print this firmware's EndF (body/image size, base_hash)
+ota folder | fold [on|off]         attach/detach an external .mota folder (host daemon) ; bare = list
+ota config | cfg | set [autofetch|autoinstall|checkpoint] ...   show/set persisted policy
+ota key | keys [add|rm <hex>]      trusted signer allowlist ; bare = list
 ota dev ...                        bring-up helpers (stage/recv/serve/verify)
 ```
 
