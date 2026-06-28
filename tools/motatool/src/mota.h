@@ -53,6 +53,10 @@ std::vector<uint8_t> ensure_endf(const std::vector<uint8_t>& image, const FwIden
 uint32_t target_id_for_env(const std::string& env);     // sha2-256:4(env) as LE uint32
 bool     pack_version(const std::string& s, uint32_t& out);   // "1.16.0[.pre]" -> packed uint32
 
+// Reverse-lookup a target_id to its PlatformIO env name from a static table of known OTA-capable envs
+// (target_id = sha2-256:4(env_name)). Returns "" if not in the table.
+std::string target_env_name(uint32_t target_id);
+
 // ---- build ----
 struct BuildOpts {
   std::vector<uint8_t> fw;            // NEW firmware (raw or already-EndF'd)

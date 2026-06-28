@@ -8,6 +8,7 @@
 #include "OtaApply.h"
 #include "OtaFormat.h"
 #include "OtaSelf.h"          // ota_self_firmware() — prefer self-describing EndF identity at begin()
+#include "OtaBlInfo.h"        // bootloader OTA-apply capability marker (nRF52); cached after first read
 #if defined(NRF52_PLATFORM) && defined(OTA_FLASH_STORE)
   #include "OtaStoreFlashNrf52.h"
 #elif defined(ESP32_PLATFORM) && defined(OTA_FLASH_STORE)
@@ -119,6 +120,15 @@ struct OtaContext {
   bool     apply_pending = false;
   uint32_t apply_at = 0;         // earliest reboot time (lets the reply get queued + start sending)
   uint32_t apply_hard = 0;       // hard cap, in case the TX queue never idles on a busy node
+
+  // Bootloader OTA-apply capability (nRF52): can THIS device's bootloader apply a .mota? Read from flash
+  // ONCE (the scan is ~40 KB) and cached in RAM. On other platforms present=false (apply is in-app).
+  OtaBlCaps _bl_caps;
+  bool      _bl_caps_read = false;
+  const OtaBlCaps& bootloaderCaps() {
+    if (!_bl_caps_read) { _bl_caps = ota_bootloader_caps(); _bl_caps_read = true; }
+    return _bl_caps;
+  }
 
   // --- discovery: the "what mOTAs are available around me" view ----------------------------------
   // The catalog (heard mOTAs) + the heard-sources table now live in OtaManager (built from beacons +

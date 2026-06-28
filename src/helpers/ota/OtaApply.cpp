@@ -20,6 +20,7 @@
   #include "OtaVerify.h"
   #include "OtaSelf.h"
   #include "OtaFlashLayout_nrf52.h"
+  #include "OtaBlInfo.h"            // read the bootloader capability marker before arming an apply
   #include "flash/flash_nrf5x.h"  // Adafruit core internal-flash driver (has its own extern "C")
   #include "nrf.h"
   #include "nrf_soc.h"
@@ -426,6 +427,13 @@ void ota_reboot_to_apply() {                   // public: set the apply magic + 
   NVIC_SystemReset();                          // does not return
 }
 
+uint8_t ota_bootloader_last_rc() {             // bootloader's last in-place-apply code, stashed in GPREGRET2
+  uint32_t v = 0;
+  uint8_t en = 0; sd_softdevice_is_enabled(&en);
+  if (en) sd_power_gpregret_get(1, &v); else v = NRF_POWER->GPREGRET2;
+  return (uint8_t)v;
+}
+
 bool ota_apply_mota_nrf52(const uint8_t* buf, uint32_t len, const SignerAllowlist& allow,
                           ApplyState& st, char* msg) {
   st = ApplyState();
@@ -435,6 +443,18 @@ bool ota_apply_mota_nrf52(const uint8_t* buf, uint32_t len, const SignerAllowlis
   st.image_size = m.image_size;
   memcpy(st.image_hash, m.image_hash, 32);
   st.manifest_ok = true;
+
+  // 0) THIS device's bootloader must be able to apply this .mota — otherwise staging + approving + rebooting
+  //    just bounces back unchanged (a legacy/stock/older-OTAFIX bootloader). Refuse here, before any reboot.
+  {
+    OtaBlCaps bl = ota_bootloader_caps();
+    if (!bl.present) { strcpy(msg, "this bootloader has no OTA-apply support — update the bootloader first"); return false; }
+    if (bl.apply_abi < m.format_ver || !(bl.codec_mask & (1u << m.codec_id))) {
+      snprintf(msg, 159, "bootloader too old to apply this update (bl abi=%u codecs=0x%x; need fmt>=%u codec=%u) — update the bootloader",
+               bl.apply_abi, bl.codec_mask, m.format_ver, m.codec_id);
+      return false;
+    }
+  }
 
   // Gated verification, in order, returning the FIRST failing reason (the bootloader re-checks integrity
   // again before booting, so authenticity is gated here and re-validated there):
@@ -481,6 +501,7 @@ bool ota_apply_commit() { return false; }
 bool ota_apply_detools_mota(const uint8_t*, uint32_t, const SignerAllowlist&, ApplyState& st, char* msg) { st = ApplyState(); strcpy(msg, "unsupported"); return false; }
 bool ota_apply_mota_nrf52(const uint8_t*, uint32_t, const SignerAllowlist&, ApplyState& st, char* msg) { st = ApplyState(); strcpy(msg, "unsupported"); return false; }
 void ota_reboot_to_apply() {}
+uint8_t ota_bootloader_last_rc() { return 0; }
 
 #endif
 

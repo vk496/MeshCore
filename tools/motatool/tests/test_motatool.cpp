@@ -3,6 +3,7 @@
 #include "mota.h"
 #include "crypto.h"
 #include "serve.h"
+#include "input.h"
 #include "util.h"
 #include "mota_format.h"
 #include <cstring>
@@ -70,6 +71,32 @@ static void t_version_target() {
   // known target ids from the firmware builds (ties motatool's hashing to the device)
   CHECK(target_id_for_env("Heltec_v3_repeater") == 0xd1b29b18u);
   CHECK(target_id_for_env("RAK_4631_repeater")  == 0x04d413fdu);
+  // reverse lookup table (human-readable target_id) -> env name, "" when unknown
+  CHECK(target_env_name(0xd1b29b18u) == "Heltec_v3_repeater");
+  CHECK(target_env_name(0x04d413fdu) == "RAK_4631_repeater");
+  CHECK(target_env_name(0xDEADBEEFu).empty());
+  // the shared (generated) table must round-trip with our own hashing for a spread of OTA envs —
+  // this catches any drift between the table's stored ids and sha2-256:4(env)
+  for (const char* e : {"Tbeam_SX1262_repeater", "Xiao_C3_repeater", "ThinkNode_M2_room_server",
+                        "Ebyte_EoRa-S3_companion_radio_ble", "Heltec_v3_companion_radio_usb"})
+    CHECK(target_env_name(target_id_for_env(e)) == e);
+}
+
+static void t_intel_hex() {
+  g_test = "intel hex";
+  fs::path hx = fs::temp_directory_path() / "motatool_test.hex";
+  // 3 data bytes (01 02 03) at addr 0, then EOF  (checksum F7 = two's-complement of the byte sum)
+  std::string ok = ":03000000010203F7\n:00000001FF\n";
+  write_file(hx.string(), (const uint8_t*)ok.data(), ok.size());
+  std::vector<uint8_t> out;
+  CHECK(read_input(hx.string(), out).empty());
+  CHECK(out.size() == 3 && out[0] == 1 && out[1] == 2 && out[2] == 3);
+  // wrong checksum -> rejected
+  std::string bad = ":03000000010203F8\n:00000001FF\n";
+  write_file(hx.string(), (const uint8_t*)bad.data(), bad.size());
+  std::vector<uint8_t> o2;
+  CHECK(!read_input(hx.string(), o2).empty());
+  fs::remove(hx);
 }
 
 static void t_endf() {
@@ -261,6 +288,7 @@ static void t_folder_and_seeder() {
 int main() {
   t_crypto();
   t_version_target();
+  t_intel_hex();
   t_endf();
   t_build_full();
   t_build_signed_and_tamper();

@@ -106,8 +106,9 @@ Android NDK, so the validation path ports as-is.
 
 ## Relationship to `tools/mota/`
 
-`motatool` is the user-facing CLI: it replaced the old Python `mota.py` (build/verify/inspect/keygen) and
-`mota_seeder.py` (serve), which have been removed. The Python `tools/mota/` directory remains as the
+`motatool` is the user-facing CLI: it replaced the old Python `mota.py` (build/verify/inspect/keygen),
+`mota_seeder.py` (serve), and `dev_motas.py` (CI `.mota` packaging — its nRF52 `.hex` extraction is now a
+built-in `motatool` input format), all removed. The Python `tools/mota/` directory remains as the
 **reference implementation** (`motalib.py`, the spec oracle + unit tests) and the **firmware build/test
-glue** (`pio_endf.py` build hook, `gen_vectors.py` test vectors, `dev_motas.py` CI packaging — which now
-drives `motatool`). Their `.mota` output is byte-identical (verified by cross-checks).
+glue** (`pio_endf.py` build hook, `gen_vectors.py` test vectors). Their `.mota` output is byte-identical
+(verified by cross-checks).

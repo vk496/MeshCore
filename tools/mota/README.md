@@ -25,9 +25,9 @@ Uses the repo's Python venv (`meshcore/`). Dependencies: `detools` (delta), `cry
 | `motalib.py` | Core logic: multihash, EndF, merkle tree+proofs, manifest/container build/parse/verify. The **reference implementation** of the spec and the unit-test oracle. Imported by everything below. |
 | `pio_endf.py` | **PlatformIO post-build hook** (wired in `platformio.ini`) that injects the `EndF` self-identity trailer into the flashed firmware (`-D ENABLE_OTA`). |
 | `gen_vectors.py` | Generates `test/test_ota/mota_vectors.h` — the cross-check vectors the native C++ tests run against. |
+| `gen_targets.py` | Generates `src/helpers/ota/OtaTargets.h` — the `target_id → env-name` table (every `ENABLE_OTA` env, resolved from `pio project config`). Shared by the firmware and `motatool` so a node can name a target seen over the air without sending the string. Regenerate when the OTA env set changes. |
 | `test_mota.py` | Unit tests for `motalib` (run directly or via pytest). |
 | `endf.py` | Standalone `EndF` trailer injector (idempotent) — handy for one-off `.bin` patching. |
-| `dev_motas.py` | CI packaging step for the rolling dev release: extracts the OTA image from a build (incl. nRF52 `.hex`) and drives `motatool build` for a full + same-image-delta `.mota`. |
 | `extract_apply.py` | Dev helper: split a firmware into payload + fixed-manifest bytes for the apply test. |
 
 ## Tests
@@ -36,6 +36,7 @@ Uses the repo's Python venv (`meshcore/`). Dependencies: `detools` (delta), `cry
 ./meshcore/bin/python tools/mota/test_mota.py      # EndF, merkle+proofs, full/delta, signing,
                                                    # tamper detection, approval enforcement
 ./meshcore/bin/python tools/mota/gen_vectors.py    # regenerate the native-test cross-check vectors
+./meshcore/bin/python tools/mota/gen_targets.py    # regenerate src/helpers/ota/OtaTargets.h (needs `pio`)
 ```
 
 ## `EndF` build integration

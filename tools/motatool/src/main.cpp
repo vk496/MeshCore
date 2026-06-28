@@ -112,6 +112,7 @@ static void help_build() {
 "\n"
 "INPUT (--fw is required)\n"
 "  --fw   <file|url>   NEW firmware. A local path OR an http(s):// URL (downloaded with curl/wget).\n"
+"                      A .bin is used as-is; a .hex (nRF52/STM32 build) is parsed to its flat image first.\n"
 "  --base <file|url>   previous firmware to diff against -> makes a delta (omit it for a full image).\n"
 "\n"
 "IDENTITY (optional — auto-read from the firmware's EndF)\n"
@@ -235,6 +236,12 @@ static void help_keygen() {
 
 static std::string hex8(uint32_t v) { char x[9]; std::snprintf(x, 9, "%08X", v); return x; }
 
+// human-readable label for a target_id (its PlatformIO env name), or "N/A" if not in the known table
+static std::string target_label(uint32_t t) {
+  std::string n = target_env_name(t);
+  return n.empty() ? "N/A" : n;
+}
+
 static int cmd_verify(const Args& a) {
   if (a.has("help")) { help_verify(); return 0; }
   if (a.pos.empty()) { help_verify(); return 2; }
@@ -274,7 +281,7 @@ static int cmd_verify(const Args& a) {
     }
     if (probs.empty()) {
       std::cout << "OK    " << f << " : " << (m.is_full() ? "full" : "delta")
-                << " target=" << hex8(m.target_id)
+                << " target=" << hex8(m.target_id) << " [" << target_label(m.target_id) << "]"
                 << " v" << version_str(m.fw_version) << " hw=" << (m.hw_id_str().empty()? "?":m.hw_id_str())
                 << " " << (m.is_signed() ? "signed" : "unsigned")
                 << " blocks=" << m.block_count << " size=" << blob.size() << "\n";
@@ -303,7 +310,8 @@ static int cmd_inspect(const Args& a) {
     << "flags          : 0x" << [&]{char x[3];std::snprintf(x,3,"%02x",m.flags);return std::string(x);}()
         << "  FULL=" << (m.is_full()?"true":"false") << " SIGNED=" << (m.is_signed()?"true":"false") << "\n"
     << "hash_algo      : 0x12 (sha2-256)\n"
-    << "target_id      : 0x" << [&]{char x[9];std::snprintf(x,9,"%08x",m.target_id);return std::string(x);}() << "\n"
+    << "target_id      : 0x" << [&]{char x[9];std::snprintf(x,9,"%08x",m.target_id);return std::string(x);}()
+        << "  (" << target_label(m.target_id) << ")\n"
     << "fw_version     : " << version_str(m.fw_version) << "  (0x"
         << [&]{char x[9];std::snprintf(x,9,"%08x",m.fw_version);return std::string(x);}() << ")\n"
     << "image_size     : " << m.image_size << "\n"
@@ -449,7 +457,7 @@ static int cmd_serve(const Args& a) {
   for (const auto& s : folder.all()) {
     std::cout << "  - " << fs::path(s.path).filename().string()
               << " : mid=" << to_hex(s.m.merkle_root.data(), 4)
-              << " target=" << [&]{char x[9];std::snprintf(x,9,"%08X",s.m.target_id);return std::string(x);}()
+              << " target=" << hex8(s.m.target_id) << " [" << target_label(s.m.target_id) << "]"
               << " v" << version_str(s.m.fw_version)
               << " " << (s.m.is_full() ? "full" : (s.m.codec_id == CODEC_DETOOLS_INPLACE ? "ipdelta" : "seqdelta"))
               << " " << (s.m.is_signed() ? "signed" : "unsigned")

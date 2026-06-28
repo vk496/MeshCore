@@ -61,10 +61,20 @@ static constexpr uint32_t MOTA_SIGNED_LEN   = 129;  // signature covers manifest
 static constexpr uint32_t DEFAULT_BLOCK_SIZE = 1024;
 static constexpr uint8_t  DEFAULT_BLOCK_SIZE_LOG2 = 10;
 
-// nRF52 in-place workspace (FS_START 0xD4000 - APP_BASE 0x26000), segment = flash page.
-// Mirror of OtaFlashLayout_nrf52.h; used as the default --inplace-memory.
-static constexpr uint32_t NRF52_INPLACE_MEMORY  = 0x000D4000u - 0x00026000u;  // 0xAE000
+// nRF52 in-place apply workspace — MUST match src/helpers/ota/OtaFlashLayout_nrf52.h
+// (MOTA_NRF52_INPLACE_MEMORY). It is NOT the full [APP_BASE, FS_START) span: the staged .mota itself sits
+// just below FS_START, so the bootloader's workspace ends at the staged container (ws_hi = mota_addr), not
+// at FS_START. The workspace is [APP_BASE, 0xBE000) = 0x98000, leaving 0xBE000..0xD4000 (~88 KB) for the
+// staged delta. A patch built with a larger memory_size overruns the workspace at apply -> DETOOLS_IO_FAILED
+// (the apply silently fails and the device just reboots). Reproduced + verified by the bootloader apply
+// simulation (Adafruit_nRF52_Bootloader_OTAFIX/test/apply_sim).
+static constexpr uint32_t NRF52_INPLACE_MEMORY  = 0x00098000u;   // 608 KB: [APP_BASE, 0xBE000)
 static constexpr uint32_t NRF52_INPLACE_SEGMENT = 4096;
+// The staged .mota sits in [APP_BASE+memory, FS_START); a larger container would push its start below the
+// workspace end and break the apply the same way. Warn (motatool) / fail (bootloader) past this.
+static constexpr uint32_t NRF52_FLASH_SPAN       = 0x000D4000u - 0x00026000u;          // 0xAE000
+static constexpr uint32_t NRF52_MAX_INPLACE_MOTA = NRF52_FLASH_SPAN - NRF52_INPLACE_MEMORY;  // 0x16000 (~90 KB)
+static_assert(NRF52_INPLACE_MEMORY < NRF52_FLASH_SPAN, "in-place workspace must leave room below FS_START for the staged .mota");
 
 // ---- mota-seeder transport protocol (mirror of src/helpers/ota/MotaSeederProto.h) ----
 // Request  (client -> server):  'M' 'S'  op(1)  args...               xsum(1 = XOR of op+args)

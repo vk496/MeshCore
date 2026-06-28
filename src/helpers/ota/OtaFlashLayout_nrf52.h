@@ -29,5 +29,11 @@ static const uint8_t  GPREGRET_OTA_APPLY    = 0x6Au;        // distinct from DFU
 // also bounds writes to < the (scanned) mota start, so a mis-sized memory still fails safe.
 static const uint32_t MOTA_NRF52_INPLACE_MEMORY = 0x00098000u;  // 608 KB (APP_BASE .. 0xBE000)
 
+// Bootloader flash region (nRF52840: 39 KB ending just below the CF2/MBR-params pages). The app scans
+// this for the bootloader capability marker (OtaBlInfo.h) to know whether THIS device's bootloader can
+// actually apply a .mota before staging+approving+rebooting.
+static const uint32_t MOTA_NRF52_BL_START = 0x000F4000u;
+static const uint32_t MOTA_NRF52_BL_END   = 0x000FE000u;
+
 } // namespace ota
 } // namespace mesh

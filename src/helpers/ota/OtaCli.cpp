@@ -2,6 +2,10 @@
 #include "OtaContext.h"
 #include "OtaVerify.h"
 #include "OtaSelf.h"
+#include "OtaTargets.h"   // ota_target_env_name(): human-readable name for a target_id (no string on the wire)
+#if defined(NRF52_PLATFORM)
+  #include "OtaBlInfo.h"  // ota_bootloader_caps(): can this device's bootloader apply a .mota?
+#endif
 #include "Utils.h"
 #include <stdio.h>
 #include <string.h>
@@ -107,10 +111,17 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
       snprintf(dl, sizeof dl, "download: %s %u/%u (%u%%) id=%s %us", state_word(fs), have, tot, pct, midhx, age);
     }
     const char* hw = (c.hw_id[0]) ? c.hw_id : "?";
-    snprintf(reply, 160, "OTA | this fw %s (%uK) hw=%s | %s | serving:%s (%u) | keys:%u | target:%08X",
+    const char* tenv = ota_target_env_name(c.manager.target());   // env name, or "?" if not in the table
+    int n = snprintf(reply, 160, "OTA | this fw %s (%uK) hw=%s | %s | serving:%s (%u) | keys:%u | target:%08X (%s)",
              selfhx, (unsigned)((s ? fi.image_len : 0) / 1024), hw, dl,
              c.serving ? "on" : "off", (unsigned)c.manager.servedCount(),
-             (unsigned)c.allow.count(), (unsigned)c.manager.target());
+             (unsigned)c.allow.count(), (unsigned)c.manager.target(), tenv ? tenv : "?");
+#if defined(NRF52_PLATFORM)
+    // nRF52 applies via the bootloader — show (cached) whether it can, so `ota get`/`install` won't surprise.
+    // blrc = the bootloader's last in-place-apply code (diagnostic; 0xB8=success, see ota_delta.c).
+    if (n < 146) n += snprintf(reply + n, 160 - n, " | bl:%s blrc:%02X",
+                               c.bootloaderCaps().present ? "apply" : "NONE", ota_bootloader_last_rc());
+#endif
 
   // ---- what's available around me (catalogued from beacons + OTA_HAVE), best/most-recent first ----
   } else if (is_cmd(a, "neighbors|nbrs|updates|ls|n", &rest)) {
@@ -130,8 +141,13 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
       bool on = cur && memcmp(cur, h->mid, 4) == 0;
       uint32_t age = (now - h->last_ms) / 1000; if (age > 99999) age = 99999;
       char ver[20]; ver_str(ver, sizeof ver, h->fw_version);
-      // is this update for THIS node (same hw+role)? '?' when either target id is unset (e.g. a manual build)
-      const char* fit = (myt == 0 || h->target_id == 0) ? "?" : (h->target_id == myt ? "yours" : "other hw");
+      // What is this update for? "yours" if same hw+role as us; else the target's env name when we know it
+      // (named locally from its 4-byte target_id — no string travels on the wire); else other hw / '?'.
+      const char* fit;
+      const char* env = ota_target_env_name(h->target_id);
+      if (myt && h->target_id == myt) fit = "yours";
+      else if (env)                   fit = env;
+      else                            fit = (h->target_id == 0) ? "?" : "other hw";
       n += snprintf(reply + n, CAP - n, "\n %d) %s %s [%s] %un %us%s", shown + 1, ver,
                     codec_kind(h->codec), fit, (unsigned)h->n_seeders, (unsigned)age,
                     on ? " [downloading]" : "");
@@ -181,7 +197,13 @@ bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board
     SelfFwInfo fi;
     if (!ota_self_firmware(fi) || !fi.valid) { strcpy(reply, "ERR no EndF (firmware lacks the trailer?)"); return true; }
     char hx[17]; mesh::Utils::toHex(hx, fi.body_hash, 8);
-    sprintf(reply, "self body=%u image=%u base_hash=%s", (unsigned)fi.body_len, (unsigned)fi.image_len, hx);
+    int n = snprintf(reply, 160, "self body=%u image=%u base_hash=%s", (unsigned)fi.body_len, (unsigned)fi.image_len, hx);
+#if defined(NRF52_PLATFORM)
+    // nRF52 applies via the bootloader, so surface whether THIS device's bootloader can (delta install gate)
+    const OtaBlCaps& bl = c.bootloaderCaps();   // cached (flash scanned once)
+    if (bl.present) snprintf(reply + n, 160 - n, " | bootloader: apply OK (abi=%u codecs=0x%x)", bl.apply_abi, bl.codec_mask);
+    else            snprintf(reply + n, 160 - n, " | bootloader: NO mota-apply support (delta install will refuse)");
+#endif
 
   } else if (is_cmd(a, "install|apply|applydelta", &rest)) {
     // Apply the fetched update. Destructive (reflashes + reboots) and GATED, not interactive (no "type

@@ -21,7 +21,12 @@ add_library(motatool_core STATIC
   src/input.cpp
   src/serve.cpp
 )
-target_include_directories(motatool_core PUBLIC src)
+# `src` for the tool's own headers; the repo's helpers/ota for the shared, generated OtaTargets.h
+# (target_id -> env-name table — single source of truth with the firmware, no hand-maintained copy).
+target_include_directories(motatool_core PUBLIC
+  src
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../src/helpers/ota"
+)
 target_link_libraries(motatool_core PUBLIC OpenSSL::Crypto)
 
 add_executable(motatool src/main.cpp)

@@ -58,5 +58,9 @@ bool ota_apply_mota_nrf52(const uint8_t* buf, uint32_t len,
 // into the slot already armed by ota_apply_detools_mota.
 void ota_reboot_to_apply();
 
+// DIAGNOSTIC (nRF52): the bootloader stashes its last in-place-apply bail/progress code in GPREGRET2 (see
+// ota_delta.c). Read it back so `ota status` can show why an apply didn't take. 0 / other platforms = n/a.
+uint8_t ota_bootloader_last_rc();
+
 } // namespace ota
 } // namespace mesh

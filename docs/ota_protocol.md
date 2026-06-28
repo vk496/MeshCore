@@ -442,6 +442,11 @@ All serving stays reactive and lowest-priority, so seeding never competes with r
 - **`target_id` vs `hw_id`** — complementary, not redundant: `target_id` is the fetch-routing key
   (hw + role + partition); `hw_id` is the human-readable brick-safety key (hardware only). Same board, two
   roles ⇒ same `hw_id`, different `target_id`.
+- **Naming a `target_id` locally:** only the 4-byte `target_id` ever travels on the wire. To show *which*
+  board/role a target is, a node (and `motatool`) reverse-looks-it-up in `src/helpers/ota/OtaTargets.h` —
+  a generated `target_id → env-name` table covering every `ENABLE_OTA` env (`tools/mota/gen_targets.py`,
+  resolved from `pio project config`). So `ota ls` can render `[Heltec_v3_repeater]` for a neighbour's
+  beacon without the string being transmitted. Unknown ids show as `other hw` / `N/A`.
 - **`fw_version`:** packed comparable uint32 (`MAJOR<<24 | MINOR<<16 | PATCH<<8 | pre`); also self-described
   in EndF. `ota ls` decodes it for display and flags each update `[yours]` / `[other hw]` / `[?]` by
   comparing the advertised `target_id` to the node's own.
