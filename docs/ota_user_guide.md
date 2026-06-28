@@ -162,13 +162,13 @@ folder of firmware files to the mesh — without storing them itself. Useful for
 remote area.
 
 1. Put the firmware files (`.mota` files — see below) in a folder on the computer.
-2. Run the helper daemon, pointing it at your node's USB port and the folder:
+2. Build the helper tool once (`tools/motatool/`), then point it at your node's USB port and the folder:
    ```
-   pip install pyserial
-   ./tools/mota/mota_seeder.py --port /dev/ttyACM0 --dir ./my_firmware/ -v
+   cmake -S tools/motatool -B tools/motatool/build && cmake --build tools/motatool/build
+   ./tools/motatool/build/motatool serve --dir ./my_firmware/ --serial /dev/ttyACM0 -v
    ```
    It turns the relay on for you and then answers the node's requests. Your node now advertises those
-   updates to neighbours, who can `ota get` them like any other. (Details: [tools/mota/README.md](../tools/mota/README.md).)
+   updates to neighbours, who can `ota get` them like any other. (Details: [tools/motatool/README.md](../tools/motatool/README.md).)
 
 To turn it off, stop the daemon (or run `ota folder off` on the node). `ota folder` on its own lists what
 your node is currently offering.

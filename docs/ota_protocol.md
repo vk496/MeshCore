@@ -1,4 +1,4 @@
-# MeshCore OTA — `.mota` container & LoRa protocol (v2)
+# MeshCore OTA — `.mota` container & LoRa protocol
 
 This is the **single source of truth** for MeshCore's over-the-air firmware update system ("mOTA"). It is
 written for developers who want to implement an interoperable peer (server, fetcher, relay, or host tool)
@@ -33,14 +33,14 @@ where a section names a source file, that file is the authoritative reference fo
 | Staging stores | `OtaStore.h`, `OtaStoreFlashNrf52.*`, `OtaStoreFlashEsp32.*` |
 | Apply | `OtaApply.*`, bootloader `Adafruit_nRF52_Bootloader_OTAFIX` |
 | Device glue (CLI/context) | `OtaCli.cpp`, `OtaContext.h` |
-| Host tooling | `tools/mota/` (`mota.py`, `motalib.py`, `mota_seeder.py`) |
+| Host tooling | `tools/motatool/` (C++ CLI: build/verify/inspect/serve); `tools/mota/` (Python reference lib `motalib.py` + build/test glue) |
 
 ---
 
 ## 1. Conventions
 
 - **Endianness:** all multi-byte integers are little-endian unless stated.
-- **Hashes (multihash):** the hash family is declared once per manifest via `hash_algo`. v2 uses
+- **Hashes (multihash):** the hash family is declared once per manifest via `hash_algo` =
   `0x12` = **SHA-256** (the [multihash](https://github.com/multiformats/multihash) code for sha2-256).
   Truncations used:
   - `sha2-256:4` — first 4 bytes of the SHA-256 digest. Merkle leaves, internal nodes, root, proofs,
@@ -73,36 +73,32 @@ where a section names a source file, that file is the authoritative reference fo
 
 ## 2. Firmware image & the `EndF` trailer
 
-Every OTA-capable build appends an `EndF` trailer to its flashed image so a running node can discover its
-own size **and self-describing identity** on any MCU (no linker symbols needed). Implemented by
-`FirmwareInfo.cpp`; appended at build time by `tools/mota/pio_endf.py` (post-build hook).
+Every OTA-capable build appends a fixed **56-byte** `EndF` trailer to its flashed image so a running node
+can discover its own size **and self-describing identity** on any MCU (no linker symbols needed). Every
+field is always present at a constant offset. Implemented by `FirmwareInfo.cpp`; appended at build time by
+`tools/mota/pio_endf.py` (post-build hook).
 
 ```
 flashed image = BODY (image bytes) || EndF trailer
-EndF trailer:
+EndF trailer (fixed 56 bytes):
   off 0   4   "EndF"        45 6E 64 46
   off 4   4   body_len      uint32 LE — length of BODY (excludes the whole trailer)
   off 8   8   body_hash     sha2-256:8 of BODY
-  --- the 16 bytes above are the whole (legacy) trailer; the identity block below is optional: ---
-  off 16  4   "EnFx"        45 6E 46 78 — present iff this is an extended (identity) trailer
-  off 20  4   fw_version    uint32 LE, packed MAJOR<<24|MINOR<<16|PATCH<<8|pre
-  off 24  4   target_id     uint32 LE — sha2-256:4(pio_env): hardware + role + partition (fetch routing)
-  off 28  32  hw_id         NUL-padded ASCII hardware tag (brick-safety), e.g. "RAK4631"
-  --- extended trailer = 60 bytes ---
+  off 16  4   fw_version    uint32 LE, packed MAJOR<<24|MINOR<<16|PATCH<<8|pre  (0 = unknown)
+  off 20  4   target_id     uint32 LE — sha2-256:4(pio_env): hardware + role + partition (fetch routing)
+  off 24  32  hw_id         NUL-padded ASCII hardware tag (brick-safety), e.g. "RAK4631" ("" = unknown)
 ```
 
-- **Self-describing identity (extended trailer).** `pio_endf.py` computes `target_id` from the PlatformIO
-  env name itself (so it's correct even without `build.sh`'s `-D MOTA_TARGET_ID`), `hw_id` from `MOTA_HW_ID`,
-  and `fw_version` from `FIRMWARE_VERSION`. The device reads them back (`ota_self_firmware()`), so a node's
-  advertised identity is correct regardless of how it was built — and the packaging tool reads them straight
-  from a raw `.bin` (no `--target-env`/`--fw-version` flags, no reliance on filenames; §9, §13).
-- **Backward-compatible:** the first 16 bytes are unchanged, so the bootloader and any legacy reader (which
-  read only `[marker, marker+16)`) are unaffected by the extension. A reader detects the extension by the
-  `EnFx` magic at `+16`; absence ⇒ a 16-byte legacy trailer (identity unknown).
+- **Self-describing identity.** `pio_endf.py` computes `target_id` from the PlatformIO env name itself (so
+  it's correct even without `build.sh`'s `-D MOTA_TARGET_ID`), `hw_id` from `MOTA_HW_ID`, and `fw_version`
+  from `FIRMWARE_VERSION`. The device reads them back (`ota_self_firmware()`), so a node's advertised
+  identity is correct regardless of how it was built — and the packaging tool reads them straight from a raw
+  `.bin` (no `--target-env`/`--fw-version` flags, no reliance on filenames; §9, §13). A dev build with no
+  dotted version simply carries `fw_version = 0` / empty `hw_id` (= unknown) — still a full 56-byte trailer.
 - **Size discovery:** scan flash from the partition top downward for the `EndF` marker; the byte before it
-  is the last BODY byte. The trailer is 60 bytes when `EnFx` follows, else 16. (See `ota_self_firmware()`.)
+  is the last BODY byte (the trailer is always 56 bytes). See `ota_self_firmware()`.
 - **Delta base matching:** a node's `body_hash` is read directly from its own `EndF`; a delta's `base_hash`
-  (§5) must equal it. `body_hash` is over BODY only, so it is identical whether the trailer is 16 or 60 bytes.
+  (§5) must equal it. `body_hash` is over BODY only.
 - **No circularity:** `EndF` hashes only the BODY, never itself.
 
 The "reconstructed image" referenced by the manifest is the full `BODY || EndF` (what gets flashed).
@@ -122,7 +118,7 @@ off            size   field
 4              4      MOTA_TOTAL_SIZE  uint32 LE — total container bytes (incl. manifest, leaves[],
                                        payload, trailer). Lets a node pre-reserve staging and compute
                                        write_start = staging_region_end − MOTA_TOTAL_SIZE.
-8              M      MANIFEST         (§4; self-delimited, no length field)
+8              M      MANIFEST         (§4; M = 197 fixed + leaves[], 4*BC; no length field — BC from payload_size)
 8 + M          P      PAYLOAD          (payload_size bytes; delta or full image)
 8 + M + P      5      TRAILER = 76 6B 34 39 36
 ```
@@ -139,8 +135,10 @@ is immutable.
 
 ## 4. The manifest
 
-Fields serialized in this exact order; conditional fields present per `flags`. Fixed head is **89 bytes**
-(through `hw_id`). Parsed by `mota_parse_manifest()`.
+**Fixed layout.** Every field sits at a constant offset and is always present — `base_hash`,
+`signer_pubkey` and `signature` are zero-filled when not applicable (a full image / an unsigned container).
+Only `leaves[]` is variable (one 4-byte hash per block). So the manifest-minus-leaves (`mfl`) is **always
+197 bytes** and the parser is plain offset reads — no conditionals. Parsed by `mota_parse_manifest()`.
 
 ```
 off  size   field            notes
@@ -157,25 +155,25 @@ off  size   field            notes
 56   1      codec_id         0=full/raw, 1=detools-sequential, 2=detools-in-place
 57   32     hw_id            NUL-padded ASCII hardware tag (e.g. "RAK4631"); same tag => bootable-compatible.
                              SIGNED. Applier refuses a mismatch (brick-safety); empty on either side = skip.
---- end of fixed 89-byte head ---
-89   8      base_hash        [iff !FULL] sha2-256:8 of the BASE image's BODY (== that build's EndF.body_hash)
-.    32     signer_pubkey    [iff SIGNED] Ed25519 public key
-.    64     signature        [iff SIGNED] Ed25519 over all bytes from off 0 up to here (exclusive)
-.    4      approval         ALWAYS present. FF FF FF FF = not approved; 41 50 52 56 ("APRV") = approved
---- end of manifest-minus-leaves (mfl); leaves_off = 8 + mfl in the container ---
-.    4*BC   leaves[]         ALWAYS present. BC = ceil(payload_size / 2^block_size_log2). sha2-256:4 each
+89   8      base_hash        sha2-256:8 of the BASE image's BODY (== that build's EndF.body_hash). 0 if FULL.
+97   32     signer_pubkey    Ed25519 public key. 0 if not SIGNED.
+129  64     signature        Ed25519 over manifest[0, 129). 0 if not SIGNED.
+193  4      approval         FF FF FF FF = not approved; 41 50 52 56 ("APRV") = approved
+--- end of manifest-minus-leaves: mfl = 197 (constant); leaves_off = 8 + 197 = 205 in the container ---
+197  4*BC   leaves[]         BC = ceil(payload_size / 2^block_size_log2). sha2-256:4 each (the only variable field)
 ```
 
-Self-delimiting: every offset is known from `flags` + `payload_size` (→ `BC`); no length field is stored.
+The signature always covers `manifest[0, 129)` (the head + `base_hash` + `signer_pubkey`). `approval` is
+outside the signed region so it can be flipped in place on consent without breaking the signature.
 
-Manifest-minus-leaves size (`mfl`): unsigned-full `89+4 = 93`, signed-full `189`, unsigned-delta `101`,
-**signed-delta `197`**. A signed manifest exceeds one packet, so `OTA_MANIFEST` is sent multi-fragment
-(§8.4) and reassembled by the fetcher.
+Manifest-minus-leaves size (`mfl`) is a constant **197 bytes** for every container (full or delta, signed
+or unsigned). At 197 bytes the manifest exceeds one packet, so `OTA_MANIFEST` is always sent multi-fragment
+(§8.4, 2 fragments) and reassembled by the fetcher.
 
 ### 4.1 Signed region
 
-`signature` covers manifest bytes `[0, signature_offset)` — everything before it, including `signer_pubkey`
-and (for deltas) `base_hash`. It does **not** cover `approval` or `leaves[]`:
+`signature` covers manifest bytes `[0, 129)` — the head + `base_hash` + `signer_pubkey`. It does **not**
+cover `approval` or `leaves[]`:
 
 - `leaves[]` are verified against the signed `merkle_root` (§6), so they need no separate signature.
 - `approval` is device-local consent (§4.2), deliberately outside the signature.
@@ -437,10 +435,10 @@ All serving stays reactive and lowest-priority, so seeding never competes with r
 - **`target_id`** (4 B): `sha2-256:4(pio_env_name)` (little-endian uint32). The env name uniquely captures
   hardware **and** role/partition, so a node auto-fetches only matching firmware (a companion image is not
   fetched onto a repeater even though it shares `hw_id`). It is **self-described in the firmware's EndF**
-  (§2, written by `pio_endf.py`) and read via `ota_self_firmware()`, so it is correct on any build; the
-  legacy `-D MOTA_TARGET_ID` / `MainBoard::getOtaTargetId()` path is the fallback. `tools/mota` reads it from
-  the firmware's EndF (or `--target-env`). A manual `ota pull`/`want` can override target (deliberate role
-  switch); the `hw_id` brick-safety gate (§4) still applies at apply time.
+  (§2, written by `pio_endf.py`) and read via `ota_self_firmware()`, so it is correct on any build;
+  `-D MOTA_TARGET_ID` / `MainBoard::getOtaTargetId()` is the fallback when no EndF identity is present.
+  `tools/mota` reads it from the firmware's EndF (or `--target-env`). A manual `ota pull`/`want` can override
+  target (deliberate role switch); the `hw_id` brick-safety gate (§4) still applies at apply time.
 - **`target_id` vs `hw_id`** — complementary, not redundant: `target_id` is the fetch-routing key
   (hw + role + partition); `hw_id` is the human-readable brick-safety key (hardware only). Same board, two
   roles ⇒ same `hw_id`, different `target_id`.
@@ -493,10 +491,11 @@ blocks) and streams payload blocks from the source on demand; proofs are generat
 
 ### 10.2 The `mota-seeder` transport (`MotaSeederProto.h`)
 
-The first concrete `MotaSource` is a host daemon (`tools/mota/mota_seeder.py`) serving a folder over the
-device's **USB serial — the same console the CLI uses** (no extra hardware). The device only emits request
-frames *while actively serving a fetch*, and reads the reply synchronously, so binary frames coexist with
-the text CLI/logs (resync on magic + checksum). Little-endian, XOR-checksummed:
+A `MotaSource` is fed by a host that serves a folder over the device's **USB serial — the same console the
+CLI uses** (no extra hardware). The host is the self-contained C++ tool `tools/motatool/` (`motatool serve`,
+which also builds + validates `.mota` and runs on small hardware). The device only emits request frames
+*while actively serving a fetch*, and reads the reply synchronously, so binary frames coexist with the text
+CLI/logs (resync on magic + checksum). Little-endian, XOR-checksummed:
 
 ```
 request  (device → host):  'M' 'S'  op(1)  args...                 xsum(1 = XOR of op+args)
@@ -514,6 +513,14 @@ Device CLI: `ota folder on` (attach + announce), `ota folder` (list), `ota folde
 `OTA_FOLDER_SERIAL` (default stream = console `Serial`; override `OTA_FOLDER_SERIAL_STREAM` + define
 `OTA_FOLDER_SERIAL_BEGIN` for a dedicated UART). Verified on hardware: a RAK4631 relays a host folder to a
 Heltec V3 over one USB cable, every block merkle-checked.
+
+**Transport-agnostic by design.** The request/response *semantics* (`COUNT` / `DESCRIBE(idx)` /
+`READ(idx, off, len)` over a folder catalog) are independent of the link. The 2-byte magic + XOR checksum +
+resync framing above exists only because a shared USB-UART is an unreliable, unframed byte stream. Over a
+framed/reliable link such as **BLE GATT** (e.g. an Android phone relaying a folder to a node), the same ops
+carry over directly — a request characteristic write delivers `op + args` and the reply is a notification
+of `status + payload`, with no magic/checksum needed. `motatool` reflects this split: a transport-free
+`SeederCore` (the catalog logic) under a serial framing layer, so a BLE transport reuses the core verbatim.
 
 ---
 
@@ -566,6 +573,7 @@ The signature proves author authenticity; `approval` proves local owner consent 
 
 ## 13. Versioning of this spec
 
-`format_ver = 2` (v2 added `hw_id` to the signed head and split discovery/transfer as in §8/§10). Future
-changes bump `format_ver`; the multihash `hash_algo` allows changing the digest family without a format
-bump. Unknown `format_ver` / `codec_id` / `ota_msg_type` values are ignored (forward-compatible).
+`format_ver = 2`. A parser accepts exactly this value and rejects anything else — there is one container
+format, fixed-layout, and no compatibility shims to carry. If the format ever needs to change, bump
+`format_ver`; the multihash `hash_algo` separately allows swapping the digest family without a format
+bump. Unknown `codec_id` / `ota_msg_type` values are ignored (a node simply won't fetch what it can't apply).

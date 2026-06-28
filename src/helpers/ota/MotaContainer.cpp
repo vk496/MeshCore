@@ -15,11 +15,11 @@ bool MotaManifest::is_approved() const {
   return approval && memcmp(approval, APPROVAL_YES, 4) == 0;
 }
 
-// Read the manifest's fixed head + conditional/variable fields from a cursor (shared by the full-container
-// and standalone-manifest parsers). Reads each field by name in declaration order (docs/ota_protocol.md §4);
-// `signed_off` is the cursor base the signature is measured from (manifest_start). Leaves/payload (only in
-// a full container) are read by the caller. Returns false on any over-read or bad format_ver.
-static bool parse_manifest_fields(ByteReader& r, uint32_t signed_off, MotaManifest& out) {
+// Fixed-layout parse (docs/ota_protocol.md §4): every field sits at a constant offset — base_hash(8),
+// signer_pubkey(32) and signature(64) are ALWAYS present (zero-filled when not applicable), so there are
+// no conditionals. Only leaves[]/payload (after `approval`) is variable, read by the caller. The signature
+// always covers manifest[0, MOTA_SIGNED_LEN). Returns false on any over-read or bad format_ver.
+static bool parse_manifest_fields(ByteReader& r, MotaManifest& out) {
   out.format_ver = r.u8();
   if (out.format_ver != MOTA_FORMAT_VER) return false;
   out.flags          = r.u8();
@@ -33,15 +33,11 @@ static bool parse_manifest_fields(ByteReader& r, uint32_t signed_off, MotaManife
   out.image_hash     = r.take(32);
   out.codec_id       = r.u8();
   out.hw_id          = r.take(32);              // 32-byte NUL-padded hardware tag (signed)
-  if (!out.is_full()) out.base_hash = r.take(8);
-  if (out.is_signed()) {
-    out.signer_pubkey = r.take(32);
-    out.signed_len = r.pos() - signed_off;      // signature covers manifest_start .. here (exclusive)
-    out.signature = r.take(64);
-  } else {
-    out.signed_len = r.pos() - signed_off;
-  }
-  out.approval = r.take(4);
+  out.base_hash      = r.take(8);               // always present (zero for a full image)
+  out.signer_pubkey  = r.take(32);              // always present (zero when unsigned)
+  out.signed_len     = MOTA_SIGNED_LEN;         // signature always covers manifest[0, 129)
+  out.signature      = r.take(64);              // always present (zero when unsigned)
+  out.approval       = r.take(4);
   if (!r.ok) return false;
   if (out.block_size_log2 == 0 || out.block_size_log2 > 24 || out.payload_size == 0) return false;
   out.block_count = (out.payload_size + out.block_size() - 1) / out.block_size();
@@ -59,7 +55,7 @@ bool mota_parse(const uint8_t* buf, uint32_t len, MotaManifest& out) {
   ByteReader r(buf, len - 5);                   // everything up to (not incl.) the trailer
   r.skip(4 + 4);                                // MAGIC + MOTA_TOTAL_SIZE (already validated)
   out.manifest_start = buf + 8;
-  if (!parse_manifest_fields(r, 8, out)) return false;
+  if (!parse_manifest_fields(r, out)) return false;
   out.leaves  = r.take(out.block_count * 4);
   out.payload = r.take(out.payload_size);
   if (!r.ok) return false;
@@ -70,7 +66,7 @@ bool mota_parse_manifest(const uint8_t* mf, uint32_t len, MotaManifest& out) {
   out = MotaManifest();
   out.manifest_start = mf;
   ByteReader r(mf, len);                         // a standalone manifest = container bytes [8, leaves)
-  return parse_manifest_fields(r, 0, out);
+  return parse_manifest_fields(r, out);
 }
 
 bool mota_check_root(const MotaManifest& m) {

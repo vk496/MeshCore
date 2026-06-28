@@ -95,7 +95,7 @@ struct DetoolsCtx {
   OtaStoreFlashEsp32* store;      // staged container; patch = payload region [patch_base, +patch_len)
   uint32_t       patch_base;      // container offset where the payload (patch) begins
 #else
-  const uint8_t* patch;           // .mota payload held wholly in RAM (legacy RAM store)
+  const uint8_t* patch;           // .mota payload held wholly in RAM (RAM store; bring-up/host)
 #endif
   uint32_t       patch_len;
   uint32_t       patch_pos;
@@ -352,7 +352,7 @@ bool ota_apply_detools_mota(OtaStoreFlashEsp32& store, const SignerAllowlist& al
   return true;
 }
 
-#else  // !OTA_FLASH_STORE: legacy RAM-staged apply (whole .mota in a contiguous RAM buffer; bring-up)
+#else  // !OTA_FLASH_STORE: RAM-staged apply (whole .mota in a contiguous RAM buffer; bring-up/host)
 
 bool ota_apply_detools_mota(const uint8_t* buf, uint32_t len, const SignerAllowlist& allow,
                             ApplyState& st, char* msg) {

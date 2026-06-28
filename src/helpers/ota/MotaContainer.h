@@ -24,17 +24,19 @@ struct MotaManifest {
   uint8_t  codec_id = 0;
   uint32_t block_count = 0;
 
-  const uint8_t* merkle_root = nullptr;   // 4
-  const uint8_t* image_hash = nullptr;    // 32
-  const uint8_t* hw_id = nullptr;         // 32 (NUL-padded ASCII hardware tag; signed; v2+)
-  const uint8_t* base_hash = nullptr;     // 8  (delta only)
-  const uint8_t* signer_pubkey = nullptr; // 32 (signed only)
-  const uint8_t* signature = nullptr;     // 64 (signed only)
-  const uint8_t* approval = nullptr;      // 4
-  const uint8_t* leaves = nullptr;        // 4 * block_count
+  // Fixed layout (docs/ota_protocol.md §4): every field below sits at a constant offset and is ALWAYS
+  // present; base_hash/signer_pubkey/signature are zero-filled when not applicable (full / unsigned).
+  const uint8_t* merkle_root = nullptr;   // 4  @20
+  const uint8_t* image_hash = nullptr;    // 32 @24
+  const uint8_t* hw_id = nullptr;         // 32 @57 (NUL-padded ASCII hardware tag; signed)
+  const uint8_t* base_hash = nullptr;     // 8  @89 (zero for a full image)
+  const uint8_t* signer_pubkey = nullptr; // 32 @97 (zero when unsigned)
+  const uint8_t* signature = nullptr;     // 64 @129 (zero when unsigned)
+  const uint8_t* approval = nullptr;      // 4  @193
+  const uint8_t* leaves = nullptr;        // 4 * block_count (the only variable-length field)
   const uint8_t* payload = nullptr;       // payload_size
   const uint8_t* manifest_start = nullptr;// first manifest byte (== start of the signed region)
-  uint32_t signed_len = 0;                // #bytes the signature covers (from manifest_start)
+  uint32_t signed_len = 0;                // = MOTA_SIGNED_LEN (129): bytes the signature covers
 
   bool is_full()   const { return flags & MFLAG_FULL; }
   bool is_signed() const { return flags & MFLAG_SIGNED; }

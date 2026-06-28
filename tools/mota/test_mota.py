@@ -61,22 +61,21 @@ def test_endf_rejects_garbage_tail():
     assert not ml.has_endf(img)
 
 
-def test_endf_extended_identity():
+def test_endf_identity():
     body = _fw(3, 4096)
     ident = ml.FwIdent(fw_version=ml.pack_version("1.16.0"),
                        target_id=ml.target_id_for_env("RAK_4631_repeater"), hw_id="RAK4631")
-    ext, h8 = ml.ensure_endf(body, ident)
-    assert len(ext) == len(body) + ml.ENDF_EXT_LEN          # 60-byte extended trailer
-    assert ml.parse_endf(ext) == (body, h8)                 # body + body_hash still parse
-    # body_hash is over BODY only -> identical to the legacy trailer (delta base_hash stays valid)
-    assert h8 == ml.ensure_endf(body)[1]
-    gi = ml.parse_endf_ident(ext)
+    img, h8 = ml.ensure_endf(body, ident)
+    assert len(img) == len(body) + ml.ENDF_LEN              # fixed 56-byte trailer
+    assert ml.parse_endf(img) == (body, h8)                 # body + body_hash parse
+    assert h8 == ml.mh8(body)                               # body_hash is over BODY only
+    gi = ml.parse_endf_ident(img)
     assert gi is not None and gi.hw_id == "RAK4631"
     assert gi.target_id == ml.target_id_for_env("RAK_4631_repeater")
     assert gi.fw_version == ml.pack_version("1.16.0")
-    # the 16-byte prefix equals the legacy trailer (bootloader-compatible); legacy images carry no identity
-    assert ext[len(body):len(body) + 16] == ml.ensure_endf(body)[0][len(body):]
-    assert ml.parse_endf_ident(ml.ensure_endf(body)[0]) is None
+    # no identity supplied -> zero-filled (still fixed size, still self-consistent)
+    z, _ = ml.ensure_endf(body)
+    assert len(z) == len(body) + ml.ENDF_LEN and ml.parse_endf_ident(z) == ml.FwIdent(0, 0, "")
 
 
 # --- merkle ----------------------------------------------------------------

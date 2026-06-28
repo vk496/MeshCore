@@ -40,7 +40,7 @@ typedef bool (*ServeReadFn)(void* ctx, uint32_t off, uint8_t* buf, uint32_t len)
 #define OTA_MF_FRAG 176             // manifest bytes per OTA_MANIFEST fragment (<= MAX_PACKET_PAYLOAD - header)
 #endif
 #ifndef OTA_MF_MAXFRAG
-#define OTA_MF_MAXFRAG 4            // max manifest fragments (a signed v2 manifest is ~2)
+#define OTA_MF_MAXFRAG 4            // max manifest fragments (the fixed 197 B manifest is always 2)
 #endif
 #ifndef OTA_MANIFEST_MAX_RETRY
 #define OTA_MANIFEST_MAX_RETRY 20   // give up (FAILED) after this many GET_MANIFEST retries — frees the slot

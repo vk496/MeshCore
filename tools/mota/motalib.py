@@ -1,7 +1,7 @@
 """
 motalib — build/parse/verify MeshCore ``.mota`` firmware-update containers.
 
-Pure logic, no CLI. Implements docs/ota_protocol.md (v1, format_ver=1).
+Pure logic, no CLI. Implements docs/ota_protocol.md (format_ver=2, fixed layout).
 
 The wire format (all integers little-endian):
 
@@ -10,10 +10,12 @@ The wire format (all integers little-endian):
     manifest  = format_ver(1) flags(1) hash_algo(1) target_id(4) fw_version(4)
                 image_size(4) payload_size(4) block_size_log2(1) merkle_root(4)
                 image_hash(32) codec_id(1) hw_id(32)
-                [base_hash(8) if delta] [signer_pubkey(32) signature(64) if signed]
-                approval(4) leaves[](4*BC)
+                base_hash(8) signer_pubkey(32) signature(64) approval(4)
+                leaves[](4*BC)
 
-Hashes are SHA-256, truncated per multihash convention (sha2-256:N = first N bytes).
+Fixed layout: every field is always present at a constant offset (base_hash/signer_pubkey/signature are
+zero-filled for a full / unsigned container), so manifest-minus-leaves is always 197 bytes and `leaves[]`
+is the only variable-length field. Hashes are SHA-256, truncated per multihash (sha2-256:N = first N bytes).
 """
 
 from __future__ import annotations
@@ -31,9 +33,10 @@ from typing import List, Optional, Tuple
 MAGIC = b"mOTA"           # 6D 4F 54 41
 TRAILER = b"vk496"        # 76 6B 34 39 36
 ENDF_MAGIC = b"EndF"      # 45 6E 64 46
-ENDF_LEN = 16             # marker(4) + body_len(4) + body_hash8(8)
+# Fixed-length trailer: marker(4) + body_len(4) + body_hash8(8) + fw_version(4) + target_id(4) + hw_id(32).
+ENDF_LEN = 56
 
-FORMAT_VER = 2          # v2 adds hw_id[32] (a NUL-padded ASCII hardware tag) in the signed head
+FORMAT_VER = 2          # the one manifest format (fixed layout, see Manifest); other values are rejected
 HASH_ALGO_SHA256 = 0x12   # multihash code for sha2-256
 
 FLAG_FULL = 0x01
@@ -109,73 +112,50 @@ def target_id_for_env(env_name: str) -> int:
 # EndF trailer
 # ---------------------------------------------------------------------------
 
-ENDF_EXT_MAGIC = b"EnFx"                   # marks an extended (identity-carrying) EndF trailer
-ENDF_EXT_LEN = ENDF_LEN + 4 + 4 + 4 + 32   # 16 + EnFx(4) + fw_version(4) + target_id(4) + hw_id(32) = 60
-
-
 @dataclass
 class FwIdent:
-    """Self-describing firmware identity, carried in the extended EndF trailer (docs/ota_protocol.md §2)
-    so a node / the packaging tool can read it straight from the firmware instead of relying on build
-    flags or filenames."""
+    """Self-describing firmware identity carried in the EndF trailer (docs/ota_protocol.md §2) so a node /
+    the packaging tool reads it straight from the firmware instead of relying on build flags or filenames."""
     fw_version: int = 0      # packed MAJOR<<24 | MINOR<<16 | PATCH<<8 | pre
     target_id: int = 0       # sha2-256:4(pio_env) as uint32 LE — hw + role + partition (fetch routing)
     hw_id: str = ""          # readable hardware tag (brick-safety), e.g. "RAK4631"
 
 
 def build_endf(body: bytes, ident: Optional["FwIdent"] = None) -> bytes:
-    """The EndF trailer for a firmware BODY: 16 bytes (legacy) or 60 bytes when `ident` is given. The
-    16-byte prefix is identical either way, so the bootloader and legacy readers (which read only the
-    first 16 bytes) are unaffected by the extension."""
-    base = ENDF_MAGIC + struct.pack("<I", len(body)) + mh8(body)
-    if ident is None:
-        return base
+    """The fixed 56-byte EndF trailer for a firmware BODY (identity zero-filled if not given)."""
+    ident = ident or FwIdent()
     hw = ident.hw_id.encode("ascii", "replace")[:32].ljust(32, b"\0")
-    return base + ENDF_EXT_MAGIC + struct.pack("<II", ident.fw_version & 0xFFFFFFFF,
-                                               ident.target_id & 0xFFFFFFFF) + hw
-
-
-def _endf_trailer_len(image: bytes) -> int:
-    """Length of the trailing EndF (60 if extended, 16 if legacy, 0 if none/invalid)."""
-    if len(image) >= ENDF_EXT_LEN:
-        t = image[-ENDF_EXT_LEN:]
-        if (t[:4] == ENDF_MAGIC and struct.unpack("<I", t[4:8])[0] == len(image) - ENDF_EXT_LEN
-                and t[16:20] == ENDF_EXT_MAGIC and t[8:16] == mh8(image[:-ENDF_EXT_LEN])):
-            return ENDF_EXT_LEN
-    if len(image) >= ENDF_LEN:
-        t = image[-ENDF_LEN:]
-        if (t[:4] == ENDF_MAGIC and struct.unpack("<I", t[4:8])[0] == len(image) - ENDF_LEN
-                and t[8:16] == mh8(image[:-ENDF_LEN])):
-            return ENDF_LEN
-    return 0
+    return (ENDF_MAGIC + struct.pack("<I", len(body)) + mh8(body)
+            + struct.pack("<II", ident.fw_version & 0xFFFFFFFF, ident.target_id & 0xFFFFFFFF) + hw)
 
 
 def has_endf(image: bytes) -> bool:
-    """True iff `image` ends with a self-consistent EndF trailer (legacy or extended)."""
-    return _endf_trailer_len(image) != 0
+    """True iff `image` ends with a self-consistent (fixed 56-byte) EndF trailer (image == BODY || EndF)."""
+    if len(image) < ENDF_LEN:
+        return False
+    t = image[-ENDF_LEN:]
+    return (t[:4] == ENDF_MAGIC and struct.unpack("<I", t[4:8])[0] == len(image) - ENDF_LEN
+            and t[8:16] == mh8(image[:-ENDF_LEN]))
 
 
 def parse_endf(image: bytes) -> Tuple[bytes, bytes]:
     """Return (body, body_hash8) for an image that ends with a valid EndF. Raises otherwise."""
-    n = _endf_trailer_len(image)
-    if not n:
+    if not has_endf(image):
         raise ValueError("image has no valid EndF trailer")
-    t = image[-n:]
-    return image[:-n], t[8:16]
+    return image[:-ENDF_LEN], image[-ENDF_LEN + 8:-ENDF_LEN + 16]
 
 
 def parse_endf_ident(image: bytes) -> Optional["FwIdent"]:
-    """The self-describing identity from an extended EndF, or None for a legacy/absent trailer."""
-    if _endf_trailer_len(image) != ENDF_EXT_LEN:
+    """The self-describing identity from a valid EndF trailer, or None if there is no valid trailer."""
+    if not has_endf(image):
         return None
-    t = image[-ENDF_EXT_LEN:]
-    fw, tgt = struct.unpack("<II", t[20:28])
-    return FwIdent(fw, tgt, t[28:60].rstrip(b"\0").decode("ascii", "replace"))
+    t = image[-ENDF_LEN:]
+    fw, tgt = struct.unpack("<II", t[16:24])
+    return FwIdent(fw, tgt, t[24:56].rstrip(b"\0").decode("ascii", "replace"))
 
 
 def ensure_endf(image: bytes, ident: Optional["FwIdent"] = None) -> Tuple[bytes, bytes]:
-    """Return (image_with_endf, body_hash8). Appends EndF (with `ident` if given) if not already present.
-    If the image already has a trailer it is kept as-is (we never rewrite an existing identity)."""
+    """Return (image_with_endf, body_hash8). Appends EndF (with `ident` if given) if not already present."""
     if has_endf(image):
         _, h8 = parse_endf(image)
         return image, h8
@@ -279,9 +259,11 @@ class Manifest:
     image_hash: bytes = b"\0" * 32
     codec_id: int = CODEC_FULL
     hw_id: bytes = b"\0" * 32                  # 32-byte NUL-padded ASCII hardware tag (signed)
-    base_hash: Optional[bytes] = None         # 8 bytes, delta only
-    signer_pubkey: Optional[bytes] = None     # 32 bytes, signed only
-    signature: Optional[bytes] = None         # 64 bytes, signed only
+    # Fixed-layout: these are ALWAYS present (zero-filled when not applicable), so the manifest has a
+    # constant size and a trivial offset-based parser; only leaves[] is variable.
+    base_hash: bytes = b"\0" * 8               # 8 bytes; zero for a full image (meaningful iff !FULL)
+    signer_pubkey: bytes = b"\0" * 32          # 32 bytes; zero when unsigned (meaningful iff SIGNED)
+    signature: bytes = b"\0" * 64              # 64 bytes; zero when unsigned (meaningful iff SIGNED)
     approval: bytes = APPROVAL_NOT
     leaves: List[bytes] = field(default_factory=list)
 
@@ -302,7 +284,7 @@ class Manifest:
         return block_count(self.payload_size, self.block_size)
 
     def signed_region(self) -> bytes:
-        """Bytes the Ed25519 signature covers: everything from format_ver up to (not incl.) signature."""
+        """Bytes the Ed25519 signature covers: format_ver .. signer_pubkey (fixed 129 bytes)."""
         out = bytearray()
         out += bytes([self.format_ver, self.flags, self.hash_algo])
         out += struct.pack("<IIII", self.target_id, self.fw_version,
@@ -312,16 +294,14 @@ class Manifest:
         out += self.image_hash
         out += bytes([self.codec_id])
         out += self.hw_id                      # 32-byte hardware tag (part of the signed head)
-        if not self.is_full:
-            out += self.base_hash
-        if self.is_signed:
-            out += self.signer_pubkey
+        out += self.base_hash                  # always present (zero for a full image)
+        out += self.signer_pubkey              # always present (zero when unsigned)
         return bytes(out)
 
     def serialize(self) -> bytes:
+        """Fixed layout: signed_region(129) + signature(64) + approval(4) + leaves[4*BC]."""
         out = bytearray(self.signed_region())
-        if self.is_signed:
-            out += self.signature
+        out += self.signature                  # always present (zero when unsigned)
         out += self.approval
         for lf in self.leaves:
             out += lf
@@ -343,11 +323,9 @@ def _validate_lengths(m: Manifest):
     assert len(m.image_hash) == 32
     assert len(m.hw_id) == 32
     assert len(m.approval) == 4
-    if not m.is_full:
-        assert m.base_hash is not None and len(m.base_hash) == 8, "delta requires 8-byte base_hash"
-    if m.is_signed:
-        assert m.signer_pubkey is not None and len(m.signer_pubkey) == 32
-        assert m.signature is not None and len(m.signature) == 64
+    assert len(m.base_hash) == 8               # fixed layout: always present (zero for full)
+    assert len(m.signer_pubkey) == 32
+    assert len(m.signature) == 64
 
 
 def build_manifest(*, target_id: int, fw_version: int, image_size: int, payload: bytes,
@@ -366,12 +344,14 @@ def build_manifest(*, target_id: int, fw_version: int, image_size: int, payload:
         image_hash=image_hash,
         codec_id=codec_id,
         hw_id=hw_id_bytes(hw_id),
-        base_hash=None if is_full else base_hash,
+        base_hash=(b"\0" * 8 if is_full else base_hash),   # always 8 bytes; zero for a full image
         leaves=leaves,
     )
+    if not is_full and (base_hash is None or len(base_hash) != 8):
+        raise ValueError("delta requires an 8-byte base_hash")
     if sign_priv is not None:
         m.signer_pubkey = sign_priv.public_key().public_bytes_raw()
-        m.signature = sign_priv.sign(m.signed_region())
+        m.signature = sign_priv.sign(m.signed_region())    # else signer_pubkey/signature stay zero
     _validate_lengths(m)
     return m
 
@@ -423,11 +403,9 @@ def parse_container(blob: bytes) -> Parsed:
     m.image_hash = take(32)
     m.codec_id = take(1)[0]
     m.hw_id = take(32)
-    if not m.is_full:
-        m.base_hash = take(8)
-    if m.is_signed:
-        m.signer_pubkey = take(32)
-        m.signature = take(64)
+    m.base_hash = take(8)               # fixed layout: always present (zero for full)
+    m.signer_pubkey = take(32)
+    m.signature = take(64)
     m.approval = take(4)
     bc = m.block_count
     m.leaves = [take(4) for _ in range(bc)]

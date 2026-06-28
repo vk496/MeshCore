@@ -84,12 +84,18 @@ jobs:
       - name: Package .mota (full + same-image delta)
         run: |
           set -euo pipefail
-          pip install --quiet detools intelhex
+          pip install --quiet detools intelhex          # detools: delta encoder (motatool shells to it); intelhex: nRF52 .hex extraction
+          # build the motatool packager (C++; OpenSSL for sha256+ed25519)
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev cmake g++ >/dev/null
+          cmake -S tools/motatool -B tools/motatool/build -DCMAKE_BUILD_TYPE=Release >/dev/null
+          cmake --build tools/motatool/build -j"$(nproc)" >/dev/null
           SHA=$(git rev-parse --short HEAD)
           python3 tools/mota/dev_motas.py \
             --env "${{ matrix.env }}" --platform "${{ matrix.platform }}" \
             --build-dir ".pio/build/${{ matrix.env }}" --target-env "${{ matrix.env }}" \
             --out-prefix "out/${{ matrix.env }}-${FIRMWARE_VERSION}-${SHA}" --work /tmp \
+            --motatool "$PWD/tools/motatool/build/motatool" \
             || echo "::warning::.mota packaging failed for ${{ matrix.env }}"
 
       - name: Upload this board's artifact

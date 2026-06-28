@@ -48,17 +48,14 @@ bool ota_self_firmware(SelfFwInfo& out) {
       out.body_len = body_len;
       out.image_len = body_len + ENDF_LEN;
       memcpy(out.body_hash, buf + i + 8, 8);
-      // Extended identity? Re-read the full trailer at the marker (it may straddle the chunk window, so
-      // the EnFx fields aren't reliably in `buf`). docs/ota_protocol.md §2.
-      uint8_t tr[ENDF_EXT_LEN];
-      if (body_len + ENDF_EXT_LEN <= p->size &&
-          esp_partition_read(p, body_len, tr, ENDF_EXT_LEN) == ESP_OK &&
-          memcmp(tr + 16, ENDF_EXT_MAGIC, 4) == 0) {
-        out.has_ident = true;
-        out.fw_version = (uint32_t)tr[20] | ((uint32_t)tr[21]<<8) | ((uint32_t)tr[22]<<16) | ((uint32_t)tr[23]<<24);
-        out.target_id  = (uint32_t)tr[24] | ((uint32_t)tr[25]<<8) | ((uint32_t)tr[26]<<16) | ((uint32_t)tr[27]<<24);
-        memcpy(out.hw_id, tr + 28, 32); out.hw_id[32] = 0;
-        out.image_len = body_len + ENDF_EXT_LEN;
+      // Fixed 56-byte trailer: re-read it whole at the marker (it may straddle the chunk window, so the
+      // identity fields aren't reliably in `buf`) and pull identity from constant offsets (docs §2).
+      uint8_t tr[ENDF_LEN];
+      if (body_len + ENDF_LEN <= p->size &&
+          esp_partition_read(p, body_len, tr, ENDF_LEN) == ESP_OK) {
+        out.fw_version = (uint32_t)tr[16] | ((uint32_t)tr[17]<<8) | ((uint32_t)tr[18]<<16) | ((uint32_t)tr[19]<<24);
+        out.target_id  = (uint32_t)tr[20] | ((uint32_t)tr[21]<<8) | ((uint32_t)tr[22]<<16) | ((uint32_t)tr[23]<<24);
+        memcpy(out.hw_id, tr + 24, 32); out.hw_id[32] = 0;
       }
       return true;
     }
@@ -167,12 +164,14 @@ bool ota_serve_self(OtaContext& c, uint32_t fw_version) {
 
   // Prefer the SELF-DESCRIBING identity embedded in our own EndF (docs §2) over build flags / the param —
   // it's correct regardless of how the firmware was built (build.sh injection, IDE, etc.).
-  uint32_t out_target = (fi.has_ident && fi.target_id) ? fi.target_id : c.manager.target();
-  uint32_t out_ver    = (fi.has_ident && fi.fw_version) ? fi.fw_version : fw_version;
-  const char* out_hw  = (fi.has_ident && fi.hw_id[0]) ? fi.hw_id : c.hw_id;
+  uint32_t out_target = fi.target_id ? fi.target_id : c.manager.target();
+  uint32_t out_ver    = fi.fw_version ? fi.fw_version : fw_version;
+  const char* out_hw  = fi.hw_id[0] ? fi.hw_id : c.hw_id;
 
-  uint8_t* m = c.serve_self_manifest;        // assemble v2 manifest-minus-leaves (full, unsigned) = 93 bytes
-  memset(m, 0, 96);
+  // Assemble the fixed-layout manifest-minus-leaves (full, unsigned) = MOTA_MFL bytes. base_hash(89),
+  // signer_pubkey(97) and signature(129) stay zero-filled (full + unsigned); only `approval` is set.
+  uint8_t* m = c.serve_self_manifest;
+  memset(m, 0, MOTA_MFL);
   m[0] = MOTA_FORMAT_VER; m[1] = MFLAG_FULL; m[2] = HASH_ALGO_SHA256;
   wr_u32le(m + 3, out_target); wr_u32le(m + 7, out_ver);
   wr_u32le(m + 11, image_size); wr_u32le(m + 15, image_size);   // full: payload == image
@@ -181,8 +180,8 @@ bool ota_serve_self(OtaContext& c, uint32_t fw_version) {
   memcpy(m + 24, image_hash, 32);
   m[56] = CODEC_FULL;
   memcpy(m + 57, out_hw, strlen(out_hw) < 32 ? strlen(out_hw) : 32);   // hw_id[32] (NUL-padded by memset)
-  memcpy(m + 89, APPROVAL_NOT, 4);            // approval marker (fetching device's apply-gate handles it)
-  return c.manager.serve_self(m, 93, c.serve_self_leaves, bc,
+  memcpy(m + MOTA_OFF_APPROVAL, APPROVAL_NOT, 4);   // approval (fetching device's apply-gate handles it)
+  return c.manager.serve_self(m, MOTA_MFL, c.serve_self_leaves, bc,
                               c.serve_self_proof, (size_t)bc * 4, self_read_cb, nullptr);
 }
 #endif

@@ -62,7 +62,7 @@ struct OtaContext {
   // count (the manager's fixed 4 KB scratch only covers <=1024 blocks; a >1 MB image needs more).
   uint8_t* serve_self_leaves = nullptr;
   uint8_t* serve_self_proof  = nullptr;
-  uint8_t  serve_self_manifest[96];   // v2 full+unsigned manifest = 89 (fixed incl. hw_id) + 4 approval
+  uint8_t  serve_self_manifest[MOTA_MFL];   // fixed-layout full+unsigned manifest-minus-leaves (197 B)
   ApplyState apply_st;           // pending apply (P6)
 
   // OTA policy (persisted via NodePrefs; autofetch lives in the manager). Conservative defaults: a fresh
@@ -158,7 +158,7 @@ struct OtaContext {
     // passed — it's correct on any build (build.sh injection, bare IDE build, ...), so `ota ls`/`status`
     // and fetch-routing show the right hardware/role instead of 0 / "".
     SelfFwInfo _fi;
-    if (ota_self_firmware(_fi) && _fi.valid && _fi.has_ident) {
+    if (ota_self_firmware(_fi) && _fi.valid) {
       if (_fi.target_id) target_id = _fi.target_id;
       if (_fi.hw_id[0]) hw = _fi.hw_id;
     }

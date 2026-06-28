@@ -494,7 +494,7 @@ void OtaManager::handleManifest(const uint8_t* m, uint16_t n) {
 
   const uint8_t* mf = _mf_buf;                   // fully reassembled manifest-minus-leaves
   uint32_t mfl = _mf_len;
-  if (mfl < 89) { _fstate = FAILED; return; }    // fixed head incl. hw_id[32]
+  if (mfl != MOTA_MFL) { _fstate = FAILED; return; }   // manifest-minus-leaves is a fixed 197 bytes
   if (!codecOk(mf[56])) { _fstate = IDLE; return; }   // codec we can't apply (lying/stale ADV) — abort
   uint32_t payload_size = rd_u32(mf + 15);
   uint8_t  bsl = mf[19];

@@ -20,15 +20,25 @@ extern "C" {
 
 using namespace mesh::ota;
 
-// Build a flashed-image layout (body || EndF) the way the host packager / build hook do.
-static std::vector<uint8_t> make_image(const std::vector<uint8_t>& body) {
+// Build a flashed-image layout (body || fixed 56-byte EndF) the way the host packager / build hook do:
+// marker(4) body_len(4) body_hash8(8) fw_version(4) target_id(4) hw_id(32). Identity is always present
+// (zero/"" = unknown).
+static std::vector<uint8_t> make_image_id(const std::vector<uint8_t>& body, uint32_t fw_version,
+                                          uint32_t target_id, const char* hw_id) {
   std::vector<uint8_t> img = body;
   img.insert(img.end(), ENDF_MAGIC, ENDF_MAGIC + 4);
   uint32_t n = (uint32_t)body.size();
   for (int i = 0; i < 4; i++) img.push_back((uint8_t)(n >> (8 * i)));
   uint8_t h[8]; mh8(h, body.data(), body.size());
   img.insert(img.end(), h, h + 8);
+  for (int i = 0; i < 4; i++) img.push_back((uint8_t)(fw_version >> (8 * i)));
+  for (int i = 0; i < 4; i++) img.push_back((uint8_t)(target_id  >> (8 * i)));
+  uint8_t hw[32] = {0}; size_t k = hw_id ? strlen(hw_id) : 0; if (k > 32) k = 32; if (k) memcpy(hw, hw_id, k);
+  img.insert(img.end(), hw, hw + 32);                      // -> fixed 56-byte trailer
   return img;
+}
+static std::vector<uint8_t> make_image(const std::vector<uint8_t>& body) {
+  return make_image_id(body, 0, 0, "");                    // zero identity (still a full 56-byte trailer)
 }
 
 // --- cross-check the C++ parser/merkle against the Python reference vectors ----------------
@@ -73,8 +83,8 @@ TEST(OtaParse, RejectsTampering) {
 // block_idx is a uint16 on the wire, so a manifest needing > 65535 blocks can't be addressed and must be
 // rejected at parse (this also keeps block_count*4 from overflowing the leaves-length computation).
 TEST(OtaParse, RejectsTooManyBlocks) {
-  auto manifest = [](uint32_t payload_size, uint8_t bsl) {           // minimal unsigned-full manifest (93 B)
-    std::vector<uint8_t> m(93, 0);
+  auto manifest = [](uint32_t payload_size, uint8_t bsl) {           // fixed-layout unsigned-full manifest
+    std::vector<uint8_t> m(MOTA_MFL, 0);
     m[0] = MOTA_FORMAT_VER; m[1] = MFLAG_FULL; m[2] = 0x12;
     m[15] = payload_size; m[16] = payload_size >> 8; m[17] = payload_size >> 16; m[18] = payload_size >> 24;
     m[19] = bsl;
@@ -232,41 +242,30 @@ TEST(OtaFirmwareInfo, FindsEndFInImage) {
   EXPECT_EQ(0, std::memcmp(fi.body_hash, h, 8));
 }
 
-// Build a body || EXTENDED EndF (identity-carrying), the way pio_endf / motalib do.
-static std::vector<uint8_t> make_image_v2(const std::vector<uint8_t>& body, uint32_t fw_version,
-                                          uint32_t target_id, const char* hw_id) {
-  std::vector<uint8_t> img = make_image(body);             // body + 16-byte base trailer
-  static const uint8_t EXT[4] = {'E','n','F','x'};
-  img.insert(img.end(), EXT, EXT + 4);
-  for (int i = 0; i < 4; i++) img.push_back((uint8_t)(fw_version >> (8 * i)));
-  for (int i = 0; i < 4; i++) img.push_back((uint8_t)(target_id  >> (8 * i)));
-  uint8_t hw[32] = {0}; size_t n = strlen(hw_id); if (n > 32) n = 32; memcpy(hw, hw_id, n);
-  img.insert(img.end(), hw, hw + 32);                      // -> 60-byte extended trailer
-  return img;
-}
-
-// The self-describing identity in an extended EndF is parsed; a legacy 16-byte trailer reports no identity.
-TEST(OtaFirmwareInfo, ParsesExtendedIdentity) {
+// The self-describing identity lives at fixed offsets in the 56-byte EndF and is always parsed; a
+// zero-identity trailer reports zero/"" (unknown), still at the fixed 56-byte size.
+TEST(OtaFirmwareInfo, ParsesIdentity) {
   std::vector<uint8_t> body(2000);
   for (size_t i = 0; i < body.size(); i++) body[i] = (uint8_t)(i * 13 + 5);
 
-  auto img = make_image_v2(body, 0x01100000u, 0x04d413fdu, "RAK4631");
+  auto img = make_image_id(body, 0x01100000u, 0x04d413fdu, "RAK4631");
   std::vector<uint8_t> region = img; region.resize(img.size() + 4096, 0xFF);
   SelfFwInfo fi;
   ASSERT_TRUE(find_self_firmware(region.data(), (uint32_t)region.size(), fi, /*verify_body=*/true));
   EXPECT_EQ(fi.body_len, body.size());
-  EXPECT_EQ(fi.image_len, body.size() + 60);               // extended trailer length
-  EXPECT_TRUE(fi.has_ident);
+  EXPECT_EQ(fi.image_len, body.size() + 56);               // fixed trailer length
   EXPECT_EQ(fi.fw_version, 0x01100000u);
   EXPECT_EQ(fi.target_id, 0x04d413fdu);
   EXPECT_STREQ(fi.hw_id, "RAK4631");
 
-  auto img1 = make_image(body);                            // legacy 16-byte trailer
+  auto img1 = make_image(body);                            // zero-identity trailer (still 56 bytes)
   std::vector<uint8_t> r1 = img1; r1.resize(img1.size() + 64, 0xFF);
   SelfFwInfo fi1;
   ASSERT_TRUE(find_self_firmware(r1.data(), (uint32_t)r1.size(), fi1, true));
-  EXPECT_FALSE(fi1.has_ident);
-  EXPECT_EQ(fi1.image_len, body.size() + 16);
+  EXPECT_EQ(fi1.fw_version, 0u);
+  EXPECT_EQ(fi1.target_id, 0u);
+  EXPECT_STREQ(fi1.hw_id, "");
+  EXPECT_EQ(fi1.image_len, body.size() + 56);
 }
 
 TEST(OtaFirmwareInfo, IgnoresStagedMotaHigherInRegion) {
