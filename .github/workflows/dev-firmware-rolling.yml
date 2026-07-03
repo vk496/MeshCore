@@ -1,0 +1,160 @@
+# Rolling DEV firmware release (fork convenience).
+#
+# On every push, rebuild a representative set of OTA-capable firmwares (ESP32 + nRF52, one per board family
+# plus the RAK4631 + Heltec T096 (nRF52) and Heltec V3 + V4 (ESP32) OTA test boards in every role) and
+# replace the `dev-latest` prerelease assets
+# with the flashable binaries (ESP32: .bin/-merged.bin; nRF52: .uf2/.zip). UNSIGNED dev builds for testing.
+# OTA `.mota` are not packaged here — build them on demand from a firmware with tools/motatool (which reads
+# a .bin or nRF52 .hex directly).
+#
+# Design (atomic, never-empty): each board builds into a workflow ARTIFACT; a final `release` job collects
+# them and ATOMICALLY recreates the release at the end. So if the run is cancelled by the next push, or some
+# boards fail to compile, the PREVIOUS release stays intact until a full new set is ready (the old "empty
+# the release first, then fill it" design left `dev-latest` empty whenever a build was cancelled/failed).
+#
+# To change which boards build, edit the `matrix.include` list below (env + its platform). Only OTA-capable
+# (ENABLE_OTA) envs make sense here. The full OTA set is ~308 envs; this is a curated ~one-per-board subset.
+
+name: Dev Firmware (rolling)
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-firmware-rolling
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: dev-latest
+  FIRMWARE_VERSION: dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- nRF52 (OTA in-place; RAK4631 is the validated target, all roles) ---
+          - { env: RAK_4631_repeater,             platform: NRF52 }
+          - { env: RAK_4631_room_server,          platform: NRF52 }
+          - { env: RAK_4631_companion_radio_ble,  platform: NRF52 }
+          - { env: RAK_4631_companion_radio_usb,  platform: NRF52 }
+          # --- nRF52 OTA test board (Heltec T096, all roles) ---
+          - { env: Heltec_t096_repeater,             platform: NRF52 }
+          - { env: Heltec_t096_room_server,          platform: NRF52 }
+          - { env: Heltec_t096_companion_radio_ble,  platform: NRF52 }
+          - { env: Heltec_t096_companion_radio_usb,  platform: NRF52 }
+          # --- ESP32 test board (Heltec V3, all roles) ---
+          - { env: Heltec_v3_repeater,            platform: ESP32 }
+          - { env: Heltec_v3_room_server,         platform: ESP32 }
+          - { env: Heltec_v3_companion_radio_ble, platform: ESP32 }
+          - { env: Heltec_v3_companion_radio_usb, platform: ESP32 }
+          # --- ESP32 OTA test board (Heltec V4, all roles) ---
+          - { env: heltec_v4_repeater,            platform: ESP32 }
+          - { env: heltec_v4_room_server,         platform: ESP32 }
+          - { env: heltec_v4_companion_radio_ble, platform: ESP32 }
+          - { env: heltec_v4_companion_radio_usb, platform: ESP32 }
+          # --- ESP32, one representative per board family ---
+          - { env: Ebyte_EoRa-S3_room_server,           platform: ESP32 }
+          - { env: Generic_E22_sx1262_repeater,         platform: ESP32 }
+          - { env: Heltec_E213_repeater,                platform: ESP32 }
+          - { env: Heltec_E290_repeater,                platform: ESP32 }
+          - { env: Heltec_T190_repeater_,               platform: ESP32 }
+          - { env: Heltec_ct62_repeater,                platform: ESP32 }
+          - { env: Heltec_v2_repeater,                  platform: ESP32 }
+          - { env: LilyGo_T3S3_sx1262_repeater,         platform: ESP32 }
+          - { env: LilyGo_TBeam_1W_repeater,            platform: ESP32 }
+          - { env: LilyGo_TDeck_repeater,               platform: ESP32 }
+          - { env: LilyGo_TETH_Elite_sx1262_repeater,   platform: ESP32 }
+          - { env: LilyGo_TLora_V2_1_1_6_repeater,      platform: ESP32 }
+          - { env: M5Stack_Unit_C6L_repeater,           platform: ESP32 }
+          - { env: Station_G2_logging_repeater,         platform: ESP32 }
+          - { env: Station_G3_ESP32_logging_repeater,   platform: ESP32 }
+          - { env: T_Beam_S3_Supreme_SX1262_repeater,   platform: ESP32 }
+          - { env: Tbeam_SX1262_repeater,               platform: ESP32 }
+          - { env: ThinkNode_M2_room_server,            platform: ESP32 }
+          - { env: Xiao_C3_repeater,                    platform: ESP32 }
+          - { env: Xiao_S3_WIO_repeater,                platform: ESP32 }
+          - { env: heltec_tracker_v2_repeater,          platform: ESP32 }
+          - { env: heltec_v4_expansionkit_repeater,     platform: ESP32 }
+          - { env: nibble_screen_connect_repeater,      platform: ESP32 }
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v6
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-environment
+
+      - name: Build ${{ matrix.env }}
+        run: /usr/bin/env bash build.sh build-firmware ${{ matrix.env }}
+        # build.sh writes the flashable firmware into out/ (ESP32: .bin + -merged.bin; nRF52: .uf2 + .zip).
+        # OTA .mota are NOT packaged in CI — build them locally with tools/motatool when needed.
+
+      - name: Upload this board's artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: fw-${{ matrix.env }}
+          path: out
+          if-no-files-found: ignore
+          retention-days: 5
+
+  # Collect every board's artifact and ATOMICALLY (re)create the rolling release. Runs even if some boards
+  # failed (if: always()), and only touches the release once assets are in hand — so a cancelled/partial run
+  # never empties dev-latest.
+  release:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v6
+
+      - name: Collect built artifacts (via gh — no download-artifact version coupling)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "${{ github.run_id }}" --dir dist 2>/dev/null || true
+          # flatten dist/fw-<env>/<files> -> dist/
+          find dist -mindepth 2 -type f -exec mv -f -t dist {} + 2>/dev/null || true
+          find dist -mindepth 1 -type d -empty -delete 2>/dev/null || true
+          echo "Collected:"; ls -la dist || true
+
+      - name: Recreate the rolling release (only if we actually have assets)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no firmware built — leaving the existing dev-latest release untouched"
+            exit 1
+          fi
+          NOTES=$(cat <<EOF
+          **Automatic development firmware — latest commit on \`${GITHUB_REF_NAME}\`.**
+
+          - Commit: \`${GITHUB_SHA}\`
+          - Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ⚠️ Unsigned dev builds for testing only. Assets are replaced on every push (this release always
+          tracks the latest commit). Embedded firmware version string: \`dev-<short-sha>\`.
+
+          A representative set of OTA-capable boards (ESP32 + nRF52): flashable firmware binaries
+          (ESP32 \`.bin\`/\`-merged.bin\`, nRF52 \`.uf2\`/\`.zip\`). To make an OTA \`.mota\` from one of
+          these, use \`tools/motatool\` (it reads a \`.bin\` or nRF52 \`.hex\` directly).
+          EOF
+          )
+          # delete + recreate so removed boards don't leave stale assets; assets are ready, so it's atomic
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$RELEASE_TAG" "${files[@]}" \
+            --title "Dev firmware (latest commit)" \
+            --notes "$NOTES" \
+            --prerelease \
+            --target "$GITHUB_SHA"
