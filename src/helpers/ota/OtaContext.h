@@ -152,6 +152,8 @@ struct OtaContext {
   uint32_t session_started_ms = 0;   // when the fetch session last left IDLE (for the age display)
   uint8_t  prev_fstate = OtaManager::IDLE;
   bool     folder_active = false;    // an external `.mota` folder is attached + being relayed
+  uint8_t  folder_link_tries = 0;    // 0 idle, 1..N retry COUNT, 0xFF folder motas registered
+  uint32_t folder_link_next_ms = 0;
 
   // Attach/detach an external folder of `.mota` served by a host daemon over the seeder UART (the node
   // then advertises + relays them alongside its own fw). Only built when OTA_FOLDER_SERIAL is configured.
@@ -164,12 +166,37 @@ struct OtaContext {
     manager.clear_sources();                                   // idempotent re-attach
     if (!manager.add_source(&src)) { strncpy(msg, "ERR no free source slot", cap); return false; }
     folder_active = true;
+    folder_link_tries = 1;          // COUNT during this CLI often fails (host still on the app protocol)
+    folder_link_next_ms = 0;        // first retry ~2s later, once the host is answering raw MS
     snprintf(msg, cap, "OK folder attached (serial) — serving %u mOTA total (own fw + folder)",
              (unsigned)manager.servedCount());
     return true;
   }
+  // Re-COUNT the host folder after `ota folder on`. Companion USB cannot answer MS until the CLI
+  // session closes, so the attach-time count is only self. When a folder mota appears, re-announce.
+  void poll_folder_link(uint32_t now) {
+    if (!folder_active || folder_link_tries == 0 || folder_link_tries == 0xFF) return;
+    if (folder_link_next_ms == 0) { folder_link_next_ms = now + 2000; return; }
+    if ((int32_t)(now - folder_link_next_ms) < 0) return;
+    folder_link_next_ms = now + 2000;
+    uint8_t before = manager.servedCount();
+    manager.refresh_sources();
+    uint8_t after = manager.servedCount();
+    if (after > before) {
+      manager.announce();
+      folder_link_tries = 0xFF;
+      return;
+    }
+    if (folder_link_tries < 15) folder_link_tries++;
+    else folder_link_tries = 0xFF;
+  }
 #endif
-  void detach_folder() { manager.clear_sources(); folder_active = false; }
+  void detach_folder() {
+    manager.clear_sources();
+    folder_active = false;
+    folder_link_tries = 0;
+    folder_link_next_ms = 0;
+  }
 
   void track_session(uint8_t fstate, uint32_t now) {            // stamp the session start (age display)
     if (fstate != prev_fstate) {

@@ -86,6 +86,9 @@ void Mesh::loop() {
         oc.manager.reset_session();        // don't auto-adopt a complete staged container on boot
       }
     }
+#if defined(OTA_FOLDER_SERIAL)
+    ota::ota_ctx().poll_folder_link(_ms->getMillis());  // companion: COUNT the host folder once raw MS is up
+#endif
     ota::ota_ctx().manager.set_clock(_ms->getMillis());   // for discovery jitter/ages + the pending-query timer
     ota::ota_ctx().manager.loop();         // re-request still-missing OTA blocks + fire scheduled queries
     _next_ota_tick = futureMillis(3000);

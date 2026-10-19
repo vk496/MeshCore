@@ -2,6 +2,10 @@
 
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
+#if defined(ENABLE_OTA)
+  #include <helpers/ota/OtaCli.h>
+  #include <helpers/ota/OtaContext.h>
+#endif
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -62,6 +66,7 @@
 #define CMD_SET_DEFAULT_FLOOD_SCOPE   63
 #define CMD_GET_DEFAULT_FLOOD_SCOPE   64
 #define CMD_SEND_RAW_PACKET           65
+#define CMD_RUN_CLI_COMMAND           66  // v14+
 
 // Stats sub-types for CMD_GET_STATS
 #define STATS_TYPE_CORE               0
@@ -97,6 +102,7 @@
 #define RESP_ALLOWED_REPEAT_FREQ      26
 #define RESP_CODE_CHANNEL_DATA_RECV   27
 #define RESP_CODE_DEFAULT_FLOOD_SCOPE 28
+#define RESP_CODE_CLI_REPLY           29  // v14+, a reply to CMD_RUN_CLI_COMMAND
 
 #define MAX_CHANNEL_DATA_LENGTH       (MAX_FRAME_SIZE - 9)
 
@@ -1071,6 +1077,22 @@ void MyMesh::handleCmdFrame(size_t len) {
     memcpy(&out_frame[i], _prefs.node_name, tlen);
     i += tlen;
     _serial->writeFrame(out_frame, i);
+  } else if (cmd_frame[0] == CMD_RUN_CLI_COMMAND && len >= 3) { // V14+
+    int i = 1;
+    char *text = (char *)&cmd_frame[i];
+    int tlen = len - i;
+    text[tlen] = 0; // ensure null
+
+    reply_buf[0] = 0;
+    bool handled = handleCommand(text, 0, reply_buf);
+#if defined(ENABLE_OTA)
+    if (!handled) handled = mesh::ota::handle_ota_command(text, reply_buf, board);
+#endif
+    if (!handled) strcpy(reply_buf, "Unknown command");
+    out_frame[0] = RESP_CODE_CLI_REPLY;
+    int rlen = strlen(reply_buf);
+    memcpy(&out_frame[1], reply_buf, rlen);
+    _serial->writeFrame(out_frame, 1 + rlen);
   } else if (cmd_frame[0] == CMD_SEND_TXT_MSG && len >= 14) {
     int i = 1;
     uint8_t txt_type = cmd_frame[i++];
@@ -2213,12 +2235,21 @@ void MyMesh::checkSerialInterface() {
 void MyMesh::loop() {
   BaseChatMesh::loop();
 
+#if defined(ENABLE_OTA) && defined(OTA_FOLDER_SERIAL)
+  // Host mota-seeder (envybot seed / motatool serve) sends raw MS/ms on Serial after `ota folder on`.
+  if (mesh::ota::ota_ctx().folder_active) {
+    if (_cli_rescue) checkCLIRescueCmd();
+    goto after_serial_usb;
+  }
+#endif
+
   if (_cli_rescue) {
     checkCLIRescueCmd();
   } else {
     checkSerialInterface();
   }
 
+after_serial_usb:
   // is there are pending dirty contacts write needed?
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {
     saveContacts();

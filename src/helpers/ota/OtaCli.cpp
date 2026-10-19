@@ -96,6 +96,7 @@ static bool is_cmd(const char* a, const char* names, const char** rest) {
 static bool handle_dev(const char* d, char* reply, OtaContext& c);
 
 bool handle_ota_command(const char* command, char* reply, mesh::MainBoard& board) {
+  if (strncmp(command, "ota", 3) != 0) return false;
   const char* a = command + 3;
   if (*a != 0 && *a != ' ') return false;
   while (*a == ' ') a++;
